@@ -1,0 +1,77 @@
+services:
+  falkordb:
+    image: falkordb/falkordb:latest
+    restart: unless-stopped
+    volumes:
+      - /mnt/miles-data/falkordb:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  miles:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      falkordb:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      # Fast SSD — active data (soul.md, memory, sessions, skills, logs, screenshots)
+      - /mnt/miles-data:/data
+      # Bulk HDD — large files that don't need fast storage (archives, videos, big downloads)
+      - /mnt/miles-bulk:/bulk
+      # HESO codebase — read-only so Miles can inspect the company's code
+      - /opt/heso:/heso:ro
+    env_file:
+      - /mnt/miles-data/.env
+    environment:
+      SANDBOX_ROOT: /data
+      DATA_DIR: /data          # one canonical tree: what Miles reads IS what he writes
+      HESO_ROOT: /heso
+      FALKORDB_HOST: falkordb
+      FALKORDB_PORT: "6379"
+    # Give an in-flight turn time to finish and save state on deploy/stop before SIGKILL.
+    stop_grace_period: 30s
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8000/status"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 90s
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    depends_on:
+      - miles
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  caddy_data:
+  caddy_config:

@@ -1,0 +1,6 @@
+# Public TLS front door for Miles. Caddy auto-provisions a Let's Encrypt cert for
+# this Azure FQDN and terminates HTTPS, reverse-proxying to the miles app (incl.
+# the /voice/stream WebSocket, which Caddy upgrades transparently).
+miles-heso.eastus.cloudapp.azure.com {
+	reverse_proxy miles:8000
+}

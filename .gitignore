@@ -1,0 +1,47 @@
+# ── Secrets & credentials (NEVER commit) ──────────────────────────────────────
+.env
+.env.*
+!.env.example
+!.env.template
+backend/.env
+backend/.env.*
+!backend/.env.example
+**/secrets/
+*.key
+*.pem
+*credentials*.json
+google_credentials.json
+secret_keys.json
+**/.keyring/
+
+# ── Agent runtime data (cookies, logins, memory, soul, journals) ──────────────
+backend/data/
+backend/data.migrated*/
+**/llm_spend.json
+**/email_send_log.json
+
+# ── Harness / tooling state (may contain session transcripts) ─────────────────
+.omc/
+**/.omc/
+.claude/
+.claude-profiles/
+
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+.venv/
+**/.venv/
+*.egg-info/
+
+# ── Frontend ──────────────────────────────────────────────────────────────────
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+*.tsbuildinfo
+
+# ── Logs & misc ───────────────────────────────────────────────────────────────
+*.log
+.DS_Store
+*.tmp

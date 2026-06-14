@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import json
+import os
 import time
 from collections import deque
 from datetime import datetime, timezone
@@ -9,8 +10,8 @@ from typing import Callable
 import structlog
 
 from agent import scribe, store
-from agent.config import LOGS_DIR, MODEL
-from agent.llm import llm_create
+from agent.config import AKSHAY_EMAIL, LOGS_DIR, ORCHESTRATOR_MODEL, WORKER_MODEL
+from agent.llm import UTILITY_MODEL, llm_create
 from agent.persona import build_system_prompt
 from agent.tools import TOOL_DEFINITIONS, TOOL_HANDLERS
 
@@ -23,10 +24,29 @@ log = structlog.get_logger()
 MAX_TOOL_ROUNDS = 1000
 NUDGE_AT_ROUND  = 990  # only fires if approaching the runaway backstop — never in normal work
 
+# Orchestrator (Opus on Foundry) is a 200k-token window and Foundry counts the output
+# reservation against it — so size the output budget to what's left, and keep in-turn growth
+# under a char ceiling that leaves room for the tool catalog + system prompt + output.
+CHARS_PER_TOKEN     = 4
+ORCH_CTX_TOKENS     = int(os.getenv("ORCH_CTX_TOKENS", "200000"))
+_OUTPUT_RESERVE_MAX = 32768
+_TOOLS_SYSTEM_MARGIN_TOKENS = 6000   # tools=TOOL_DEFINITIONS + headroom, not counted in messages
+
 WRAPUP_NUDGE = (
     "[system] You've been going a very long time on this single turn — that's unusual. "
     "Make sure you're not stuck in a loop. Land it now: update the ledger, set_heartbeat() "
     "if work remains, and reply with a brief status. Don't start anything new."
+)
+
+# Cost control: the premium orchestrator (Opus) runs only the turns that warrant it; the rest
+# run on the cheap worker. A tiny utility-model triage decides the ambiguous (external) cases.
+_IMPORTANCE_PROMPT = (
+    "You triage incoming work for an autonomous CMO agent and decide if it needs the TOP-TIER "
+    "model. Answer 'important' for: a real decision or judgment call; a serious reply from a "
+    "customer, partner, investor, or press; anything about money, pricing, contracts, legal, or a "
+    "deal moving; or anything high-stakes. Answer 'routine' for: a bounce or auto-reply, a "
+    "newsletter or notification, cold-outreach legwork, scheduling, research, or admin. "
+    "Reply with exactly one word: important or routine."
 )
 
 
@@ -37,7 +57,7 @@ class Agent:
     boot compiles exactly like any other turn."""
 
     def __init__(self):
-        self.model = MODEL
+        self.model = ORCHESTRATOR_MODEL   # the main loop runs on the orchestrator tier (Opus)
         self.broadcast: Callable | None = None
         self.is_running: bool = False
         # Set by inbox_watcher when Akshay emails mid-run; cleared after injection
@@ -79,6 +99,41 @@ class Agent:
             "don't re-send something that already went out."
         )
 
+    # ── Model routing (cost control) ────────────────────────────────────────────
+
+    async def _is_important(self, message: str) -> bool:
+        """Cheap utility-model triage: does this external item warrant the premium model?
+        Fails safe to routine (worker) so a classifier hiccup never burns Opus."""
+        try:
+            resp = await llm_create(
+                model=UTILITY_MODEL,
+                messages=[
+                    {"role": "system", "content": _IMPORTANCE_PROMPT},
+                    {"role": "user", "content": (message or "")[:2000]},
+                ],
+                max_tokens=4,
+                temperature=0,
+            )
+            ans = (resp.choices[0].message.content or "").strip().lower()
+            return ans.startswith("important") or ans.startswith("yes")
+        except Exception:
+            return False
+
+    async def _pick_tier(self, trigger: str, user_message: str) -> str:
+        """Route the turn to a model by importance. Opus only for the founder and genuinely
+        high-stakes work; everything else (heartbeats, routine outreach, bounces, research,
+        dispatch results) runs on the cheap worker."""
+        t = (trigger or "").lower()
+        if t == "user" or (AKSHAY_EMAIL and AKSHAY_EMAIL.lower() in t):
+            tier = ORCHESTRATOR_MODEL                      # the founder is always top-tier
+        elif t.startswith(("email:", "call:")):
+            tier = ORCHESTRATOR_MODEL if await self._is_important(user_message) else WORKER_MODEL
+        else:
+            tier = WORKER_MODEL                            # heartbeats, dispatch results, etc.
+        log.info("turn_tier", tier=tier, trigger=trigger)
+        await self._emit("status", {"status": "tier", "message": tier})
+        return tier
+
     # ── Public entry point ─────────────────────────────────────────────────────
 
     async def run(self, user_message: str, trigger: str = "user") -> str:
@@ -88,6 +143,10 @@ class Agent:
         self._akshay_interrupt = None
         try:
             await self._emit("start", {"trigger": trigger, "message": user_message})
+
+            # Pick the model for THIS turn: premium (Opus) for the founder + high-stakes work,
+            # cheap worker for everything routine. Keeps the always-on burn off the premium tier.
+            self.model = await self._pick_tier(trigger, user_message)
 
             # Persist the trigger immediately — a deploy/kill mid-turn can't lose the
             # request we're about to work on, because it's already in the log. The id marks
@@ -132,8 +191,24 @@ class Agent:
     # ── Tool loop ──────────────────────────────────────────────────────────────
 
     @staticmethod
+    def _msg_size(m: dict) -> int:
+        """Char weight of a message — content + reasoning + tool_call ARGUMENTS (a long
+        write_report / email arg can be the bulk of a turn, so it must count)."""
+        s = len(str(m.get("content") or "")) + len(str(m.get("reasoning_content") or ""))
+        for tc in (m.get("tool_calls") or []):
+            s += len(str(tc.get("function", {}).get("arguments") or ""))
+        return s
+
+    @classmethod
+    def _output_budget(cls, messages: list[dict]) -> int:
+        """How many output tokens we can safely ask for without prompt+output blowing the
+        orchestrator's 200k window (Foundry counts the reservation against it)."""
+        prompt_tokens = sum(cls._msg_size(m) for m in messages) // CHARS_PER_TOKEN + _TOOLS_SYSTEM_MARGIN_TOKENS
+        return max(2048, min(_OUTPUT_RESERVE_MAX, ORCH_CTX_TOKENS - prompt_tokens))
+
+    @classmethod
     def _compact_tool_results(
-        messages: list[dict], max_chars: int = 600_000, keep_recent: int = 6
+        cls, messages: list[dict], max_chars: int = 360_000, keep_recent: int = 6
     ) -> list[dict]:
         """In-turn Tier-1 compaction (Claude-Code style): when a single turn's history
         balloons past max_chars, *clear* old bulk rather than truncate it. This is what
@@ -147,9 +222,7 @@ class Agent:
         Truncating mid-string corrupts JSON/HTML and still costs tokens, so we clear whole
         fields. This is the IN-turn safety net; across turns, store.compile_context bounds
         the window from the source of truth."""
-        def _size(m):
-            return len(str(m.get("content") or "")) + len(str(m.get("reasoning_content") or ""))
-        total = sum(_size(m) for m in messages)
+        total = sum(cls._msg_size(m) for m in messages)
         if total <= max_chars:
             return messages
         out = [dict(m) for m in messages]
@@ -171,6 +244,21 @@ class Agent:
                     marker = f"[old tool result cleared — was {len(content):,} chars]"
                     out[i] = {**m, "content": marker}
                     total -= len(content) - len(marker)
+            # A turn's bulk can live in a large tool-call argument (write_report, a long email
+            # body) — shed those from old calls too; the durable log keeps the real call.
+            if total > max_chars and m.get("tool_calls"):
+                new_tcs, changed = [], False
+                for tc in m["tool_calls"]:
+                    args = str(tc.get("function", {}).get("arguments") or "")
+                    if len(args) > 600:
+                        marker = '{"_cleared": "large argument dropped to fit context"}'
+                        new_tcs.append({**tc, "function": {**tc["function"], "arguments": marker}})
+                        total -= len(args) - len(marker)
+                        changed = True
+                    else:
+                        new_tcs.append(tc)
+                if changed:
+                    out[i] = {**out[i], "tool_calls": new_tcs}
         return out
 
     # Secret values must never reach the event log or the websocket feed —
@@ -262,21 +350,22 @@ class Agent:
                     messages=send_messages,
                     tools=TOOL_DEFINITIONS,
                     tool_choice="auto",
-                    max_tokens=32768,
+                    max_tokens=self._output_budget(send_messages),
                 )
             except Exception as e:
-                # 429/5xx were already retried with backoff inside llm_create. A 400 here
-                # is usually context overflow — trim hard and try once more.
-                if "400" in str(e):
+                # 429/5xx + connection errors were already retried (and failed over) inside
+                # llm_create. A 400 here is usually context overflow — trim HARD, shrink the
+                # output reservation, and try once more so a long turn doesn't fail closed.
+                if "400" in str(e) or "context" in str(e).lower():
                     await self._emit("status", {"status": "retrying", "message": "400 — trimming context and retrying"})
                     try:
-                        send_messages = self._compact_tool_results(messages, max_chars=200_000)
+                        send_messages = self._compact_tool_results(messages, max_chars=140_000)
                         response = await llm_create(
                             model=self.model,
                             messages=send_messages,
                             tools=TOOL_DEFINITIONS,
                             tool_choice="auto",
-                            max_tokens=32768,
+                            max_tokens=8192,
                         )
                     except Exception as e2:
                         err = f"[LLM error after retry] {e2}"

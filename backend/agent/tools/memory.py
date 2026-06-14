@@ -11,10 +11,10 @@ import re
 from datetime import datetime, timedelta, timezone
 
 import structlog
-from openai import OpenAI
 
 from agent import runtime, store
-from agent.config import AZURE_API_KEY, AZURE_ENDPOINT, DREAMS_DIR, MODEL
+from agent.config import DREAMS_DIR, WORKER_MODEL
+from agent.llm import llm_create
 
 log = structlog.get_logger()
 
@@ -62,10 +62,6 @@ Today's analyses ({date}):
 {analyses}"""
 
 
-def _client() -> OpenAI:
-    return OpenAI(base_url=AZURE_ENDPOINT, api_key=AZURE_API_KEY)
-
-
 async def journal_entry(event_type: str, content: str) -> str:
     """Log an event as an episode in the store — the raw material the dream consolidates."""
     try:
@@ -103,7 +99,7 @@ def _parse_sections(text: str) -> dict[str, str]:
     return sections
 
 
-async def _update_blocks(client: OpenAI, date_str: str, results: list[tuple[str, str]]) -> tuple[str, bool]:
+async def _update_blocks(date_str: str, results: list[tuple[str, str]]) -> tuple[str, bool]:
     """Refine the dream-owned memory blocks in the store from today's analyses (Letta
     pattern: the sleep agent has write authority over memory; the waking agent only reads).
     Append-and-refine, never a fresh rewrite, so hard-won specifics don't erode.
@@ -117,9 +113,8 @@ async def _update_blocks(client: OpenAI, date_str: str, results: list[tuple[str,
         if not analyses.strip():
             return "blocks unchanged — no analyses", False
         prompt = _SOUL_PROMPT.format(current=_current_sections(), analyses=analyses, date=date_str)
-        resp = await asyncio.to_thread(
-            client.chat.completions.create,
-            model=MODEL,
+        resp = await llm_create(
+            model=WORKER_MODEL,
             messages=[{"role": "user", "content": prompt}],
             max_tokens=2048,
             temperature=0.3,
@@ -154,13 +149,11 @@ async def dream(date_str: str = "") -> str:
     episode_text = "\n\n".join(
         f"[{e['created_at']} | {e['kind']}]\n{e['content']}" for e in episodes
     )
-    client = _client()
 
     async def _analyze(lens_name: str, lens_prompt: str) -> tuple[str, str]:
         try:
-            resp = await asyncio.to_thread(
-                client.chat.completions.create,
-                model=MODEL,
+            resp = await llm_create(
+                model=WORKER_MODEL,
                 messages=[
                     {
                         "role": "system",
@@ -175,7 +168,11 @@ async def dream(date_str: str = "") -> str:
                 max_tokens=600,
                 temperature=0.3,
             )
-            return lens_name, resp.choices[0].message.content.strip()
+            msg = resp.choices[0].message
+            # DeepSeek (a reasoning model) can return content=None with text in
+            # reasoning_content — fall back to it so a lens never crashes on .strip().
+            content = (msg.content or getattr(msg, "reasoning_content", "") or "").strip()
+            return lens_name, content or "[analysis empty]"
         except Exception as e:
             return lens_name, f"[analysis failed: {e}]"
 
@@ -219,7 +216,7 @@ async def dream(date_str: str = "") -> str:
                 log.warning("graphiti_communities_failed", err=str(e))
         log.info("graphiti_ingest", ingested=ingested, failed=ingest_failed)
 
-    block_status, blocks_written = await _update_blocks(client, date_str, results)
+    block_status, blocks_written = await _update_blocks(date_str, results)
 
     # Only retire the episodes if consolidation actually LANDED somewhere — a block write
     # or a graph ingest. If both failed (LLM/parse error AND Graphiti down or every lens

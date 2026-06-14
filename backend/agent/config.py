@@ -30,9 +30,18 @@ MILES_DB        = DATA_DIR / "miles.db"   # single source of truth (see agent/st
 
 KEYRING_SERVICE = "heso-ceo-miles"
 
-MODEL          = os.getenv("MODEL", "Kimi-K2.6")
+MODEL          = os.getenv("MODEL", "Kimi-K2.6")   # Kimi — still used by browser-use, vision, voice summary
 AZURE_ENDPOINT = os.getenv("AZURE_ENDPOINT")
 AZURE_API_KEY  = os.getenv("AZURE_API_KEY")
+
+# Azure AI Foundry — the tiered model stack. Opus 4.8 orchestrates (main loop), DeepSeek-V4-Pro
+# is the default worker (sub-agents, dreams), a cheap model handles utility (scribe, style).
+# These are TIER ALIASES; agent/llm.py maps them to real deployments + endpoints, and degrades
+# to Kimi if FOUNDRY_* is unset so a misconfigured deploy still runs.
+FOUNDRY_ENDPOINT   = os.getenv("FOUNDRY_ENDPOINT", "").rstrip("/")
+FOUNDRY_API_KEY    = os.getenv("FOUNDRY_API_KEY", "")
+ORCHESTRATOR_MODEL = "orchestrator"
+WORKER_MODEL       = "worker"
 EMAIL_ADDRESS  = os.getenv("EMAIL_ADDRESS", "miles@heso.ca")
 AKSHAY_EMAIL   = os.getenv("AKSHAY_EMAIL", "akshay@heso.ca")
 

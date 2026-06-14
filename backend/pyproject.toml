@@ -27,6 +27,7 @@ dependencies = [
     "twilio>=9.10.9",
     "markdown-it-py>=3.0.0",
     "markdownify>=0.13.0",
+    "litellm>=1.83.0",
 ]
 
 [tool.uv]

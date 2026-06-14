@@ -22,12 +22,13 @@ from agent.tools import (
     vision,
     voice_call,
     web,
+    web_cli,
 )
 from agent.tools.heartbeats import cancel_heartbeat
 from agent.tools.tasks import open_tasks_summary
 
 _MODULES = (
-    files, gmail, calendar_tools, web, browser, verification, vision,
+    files, gmail, calendar_tools, web, web_cli, browser, verification, vision,
     system, secrets_store, skills, memory, tasks, contacts, subagent, dispatch, voice_call, heartbeats,
 )
 

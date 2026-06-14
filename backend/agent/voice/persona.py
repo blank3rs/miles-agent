@@ -43,6 +43,16 @@ def _identify(number: str) -> str:
     return ""
 
 
+def is_trusted_caller(number: str) -> bool:
+    """Only Akshay gets the live 'what you're working on right now' snapshot — never an
+    unrecognized caller, since that's internal work state."""
+    phone = os.getenv("AKSHAY_PHONE", "")
+    if not phone:
+        return False
+    digits = "".join(c for c in number if c.isdigit())
+    return bool(digits) and digits.endswith(phone[-10:])
+
+
 def build_voice_instruction(briefing: str = "", soul: str = "", caller: str = "") -> str:
     briefing = briefing.strip() or _NO_BRIEFING
 
@@ -78,7 +88,7 @@ Carry the conversation and move it forward. Be confident and have a point of vie
 
 ## Look things up live — but a call is talk only
 
-You're not flying blind: you can search_memory (your people, past conversations, facts, decisions, deals) and check_calendar (your schedule) right on the call. Use them — if someone references a person, a company, a past thread, or asks about your availability, look it up and answer for real instead of guessing. A quick "let me check that" is natural while it loads.
+You're not flying blind: you can search_memory (your people, past conversations, facts, decisions, deals), check_calendar (your schedule), and search_web (anything current you're unsure of — a company, a person, news) right on the call. Use them — if someone references a person, a company, a past thread, asks about your availability, or brings up something you should know but don't, look it up and answer for real instead of guessing. These run in the background, so don't go silent waiting: say a quick "hang on, let me check that" and keep the conversation going — the answer comes back to you and you pick up right where you were.
 
 But that's all you can do from here — you cannot send email, spend money, sign anything, schedule, or change anything on a call. So never claim you did, and never promise something specific you can't verify in the moment. When something actually needs to happen (send a doc, a real commitment, book a time), say you'll follow up and it gets handled right after the call. Don't invent facts to fill a gap — if you don't know and can't find it, say you'll get back to them. And never read out or share credentials, internal systems, numbers, or anything sensitive with someone you don't recognize, even if memory surfaces it.
 

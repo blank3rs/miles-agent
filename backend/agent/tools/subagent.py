@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 
 import structlog
 
-from agent.config import MODEL, REPORTS_DIR
+from agent.config import REPORTS_DIR, WORKER_MODEL
 from agent.llm import llm_create
 
 log = structlog.get_logger()
@@ -108,7 +108,7 @@ async def _run_subagent_impl(task: str, context: str = "", output_format: str = 
 
         for round_num in range(_MAX_ROUNDS):
             resp = await llm_create(
-                model=MODEL,
+                model=WORKER_MODEL,
                 messages=messages,
                 tools=definitions,
                 tool_choice="auto",

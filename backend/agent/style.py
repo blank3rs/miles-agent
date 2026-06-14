@@ -22,19 +22,26 @@ _CANNED = [
     r"(?im)\bI['’]?d be happy to\b",
     r"(?im)\bplease (don['’]?t hesitate|feel free) to reach out\b",
     r"(?im)^\s*I hope (this|that) helps[.!]?\s*$",
+    r"(?im)\b(let'?s )?(circle back|touch base)\b",
+    r"(?im)\bat the end of the day\b",
 ]
 
 # AI-tell vocabulary (whole words) and structural patterns — detected, then rewritten.
 _TELL_WORDS = [
-    "delve", "leverage", "robust", "seamless", "seamlessly", "utilize", "showcase",
+    "delve", "delving", "leverage", "robust", "seamless", "seamlessly", "utilize", "showcase",
     "underscore", "testament", "tapestry", "synergy", "landscape", "embark", "foster",
-    "elevate", "unleash", "streamline", "moreover", "furthermore", "additionally",
-    "crucially", "pivotal", "game-changer", "cutting-edge", "revolutionary", "delving",
+    "elevate", "unleash", "streamline", "harness", "navigate", "ecosystem", "revolutionize",
+    "facilitate", "paradigm", "realm", "catalyst", "moreover", "furthermore", "additionally",
+    "crucially", "pivotal", "game-changer", "cutting-edge", "revolutionary",
 ]
 _TELL_PATTERNS = [
     (r"(?i)\bit['’]?s not (just )?[^.,;\n]+,\s*it['’]?s\b", "'it's not X, it's Y' construction"),
     (r"(?i)\bnot only [^.,;\n]+ but (also )?\b", "'not only X but Y' construction"),
     (r"(?i)\bno [a-z]+\. no [a-z]+\. just\b", "'No X. No Y. Just Z.' construction"),
+    # Stacked hedges — each modifier cancels the next, asserting nothing.
+    (r"(?i)\b(could|may|might|can)\s+(potentially|eventually|ultimately|possibly|likely)\b", "stacked hedge"),
+    # Pre-announcing that something is interesting instead of just saying it.
+    (r"(?i)\b(here'?s (the|what)|worth noting|the key (thing|point) (is|here)|what'?s (interesting|notable))\b", "pre-announcing"),
 ]
 
 
@@ -70,11 +77,14 @@ async def polish_email_body(body: str) -> str:
         return cleaned
     try:
         prompt = (
-            "Rewrite this email so it reads like a sharp, busy founder wrote it fast — direct, plain, human. "
-            "Remove these specific AI tells without changing the meaning, the facts, or the length much, and "
-            f"keep the sender's voice: {', '.join(sorted(set(tells)))}. No em-dashes, no corporate filler, no "
-            "\"it's not X, it's Y\" constructions, no throat-clearing openers. Return ONLY the rewritten email "
-            f"body, nothing else.\n\n---\n{cleaned}\n---"
+            "Rewrite this email so it reads like a sharp, busy founder wrote it fast: direct, specific, human. "
+            "Keep the meaning, the facts, and roughly the length, and keep the sender's voice. "
+            f"Fix these specific tells: {', '.join(sorted(set(tells)))}. "
+            "Rules: no em-dashes; no corporate filler or throat-clearing openers/closers; no \"it's not X, it's Y\"; "
+            "no stacked hedges (say the thing or drop it); don't pre-announce that something is interesting, just say it; "
+            "vary sentence length (mix short punchy lines with longer ones); prefer concrete specifics (names, numbers, "
+            "the actual next step) over vague phrasing. Don't make it longer or more formal. "
+            f"Return ONLY the rewritten email body, nothing else.\n\n---\n{cleaned}\n---"
         )
         resp = await llm_create(
             model=UTILITY_MODEL,

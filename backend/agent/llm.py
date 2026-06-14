@@ -1,81 +1,144 @@
-"""Shared, resilient LLM access for every model caller.
+"""Resilient, TIERED LLM access for every model caller.
 
-The Azure Kimi-K2.6 endpoint rate-limits hard. Without coordination the main tool
-loop, every research sub-agent, and the compaction summarizer each hammer it
-independently and trip 429s — and a single 429 used to end a whole turn, throwing
-away every tool round it had done. This module centralizes:
+One entry point — llm_create — routes by a TIER alias to the right model + endpoint through
+LiteLLM, which normalizes Azure AI Foundry's two surfaces (Claude's native /anthropic Messages
+API and the /openai/v1 trio) into one OpenAI-shaped call. Callers keep the OpenAI message +
+tool-call format, so the orchestrator can be Claude without rewriting core.py.
 
-  - a process-wide concurrency cap (one Semaphore shared by all async callers), so
-    we never fan out more simultaneous requests than the quota tolerates,
-  - retry with exponential backoff that honors Retry-After, so a transient 429/5xx
-    is ridden out in place instead of killing the turn,
-  - provider routing, so utility work (summaries, etc.) goes to a cheap OpenAI model
-    (gpt-4o-mini) instead of competing for Kimi's scarce quota, and
-  - spend tracking with a generous monthly circuit-breaker, so a runaway can't quietly
-    burn the budget.
+  orchestrator -> Claude Opus 4.8   (Foundry /anthropic)   — the main loop's brain (plans, delegates)
+  worker       -> DeepSeek-V4-Pro   (Foundry /openai/v1)   — sub-agents, dreams (high volume, cheap)
+  utility      -> gpt-4o-mini        (OpenAI) or worker     — scribe, style, classify
+  worker_kimi  -> Kimi-K2.6          (AZURE_ENDPOINT)        — escalation + the failover brain
 
-browser-use drives its own client (one browser at a time via a lock), so the true
-ceiling is _MAX_CONCURRENCY async callers + 1 browser.
+Resilience: each LANE (orchestrator / worker / utility) has its own concurrency semaphore so a
+worker 429 storm can't starve Opus; retries cover 429/5xx AND connection/timeout errors; and if a
+Foundry tier dies (outage, revoked key, sustained 429) the call FAILS OVER to Kimi so the loop
+stays up instead of going dark. If FOUNDRY_* is unset the whole stack degrades to Kimi at import.
+Spend is metered per-tier with a monthly circuit-breaker. The static key never reaches a log.
 """
 import asyncio
 import json
 import os
 import random
+import time
 from datetime import datetime, timezone
 
+import litellm
 import structlog
-from openai import OpenAI
 
-from .config import AZURE_API_KEY, AZURE_ENDPOINT, DATA_DIR, MODEL
+from .config import (
+    AZURE_API_KEY,
+    AZURE_ENDPOINT,
+    DATA_DIR,
+    FOUNDRY_API_KEY,
+    FOUNDRY_ENDPOINT,
+    MODEL,
+)
 
 log = structlog.get_logger()
 
-# Kimi (Azure) is the default reasoning brain. OpenAI handles cheap utility calls and
-# only exists if a key is set. max_retries=0 because retries are handled here.
-_azure_client = OpenAI(base_url=AZURE_ENDPOINT, api_key=AZURE_API_KEY, max_retries=0)
+litellm.drop_params = True        # silently drop a param a given provider doesn't support
+litellm.suppress_debug_info = True
+
+# Exceptions that mean "transient — retry", on top of the retryable HTTP statuses. LiteLLM wraps
+# socket/DNS/TLS resets and read timeouts as these and they carry no .status_code, so a status-only
+# check would never retry the most common always-on failures.
+try:
+    from litellm.exceptions import (
+        APIConnectionError,
+        InternalServerError,
+        ServiceUnavailableError,
+        Timeout,
+    )
+    _RETRYABLE_EXC: tuple = (APIConnectionError, Timeout, ServiceUnavailableError, InternalServerError)
+except Exception:  # pragma: no cover — defensive across litellm versions
+    _RETRYABLE_EXC = ()
+
 _openai_key = os.getenv("OPENAI_API_KEY", "")
-_openai_client = OpenAI(api_key=_openai_key, max_retries=0) if _openai_key else None
 
-# Cheap model for utility work (compaction summaries, classification). Falls back to
-# the main model if no OpenAI key is configured.
-UTILITY_MODEL = os.getenv("UTILITY_MODEL", "gpt-4o-mini") if _openai_client else MODEL
 
-_MAX_CONCURRENCY = int(os.getenv("LLM_MAX_CONCURRENCY", "3"))
-_MAX_ATTEMPTS    = int(os.getenv("LLM_MAX_ATTEMPTS", "6"))
-_RETRYABLE_STATUS = {429, 500, 502, 503, 504}
+# ── Tier registry ────────────────────────────────────────────────────────────────
+def _build_tiers() -> dict:
+    """alias -> {model, api_base, api_key, lane}. lane selects the concurrency semaphore."""
+    t: dict = {}
+    if FOUNDRY_ENDPOINT and FOUNDRY_API_KEY:
+        t["orchestrator"] = {
+            "model": "azure_ai/" + os.getenv("ORCH_DEPLOYMENT", "claude-opus-4-8"),
+            "api_base": FOUNDRY_ENDPOINT + "/anthropic", "api_key": FOUNDRY_API_KEY, "lane": "orch",
+        }
+        t["worker"] = {
+            "model": "openai/" + os.getenv("WORKER_DEPLOYMENT", "DeepSeek-V4-Pro"),
+            "api_base": FOUNDRY_ENDPOINT + "/openai/v1", "api_key": FOUNDRY_API_KEY, "lane": "work",
+        }
+    else:
+        log.warning("foundry_unset_degrading_to_kimi")
+        kimi = {"model": "openai/" + MODEL, "api_base": AZURE_ENDPOINT, "api_key": AZURE_API_KEY}
+        t["orchestrator"] = {**kimi, "lane": "orch"}
+        t["worker"] = {**kimi, "lane": "work"}
+    # Kimi escalation/failover worker (existing endpoint).
+    t["worker_kimi"] = {"model": "openai/" + MODEL, "api_base": AZURE_ENDPOINT, "api_key": AZURE_API_KEY, "lane": "work"}
+    # Utility — cheap, on its OWN lane so scribe/style bursts can't eat worker capacity.
+    if _openai_key:
+        t["utility"] = {"model": "openai/gpt-4o-mini", "api_base": None, "api_key": _openai_key, "lane": "util"}
+    else:
+        t["utility"] = {**t["worker"], "lane": "util"}
+    return t
 
-# Blended $/token (input, output). Generous monthly cap is a runaway backstop, not a
-# tight budget — set LLM_MONTHLY_USD_CAP lower to tighten.
-_PRICING = {
+
+_TIERS = _build_tiers()
+UTILITY_MODEL = "utility"   # re-exported alias (scribe.py, style.py import this)
+
+# Price each tier by its ALIAS, not the response model — a Foundry deployment id (which the
+# operator can rename via ORCH_DEPLOYMENT) often isn't in any price table, and metering the
+# orchestrator as if it were cheap is how a $300 cap becomes a $5k bill.
+_PRICING = {                       # ($/token in, out)
+    "claude-opus": (15.0e-6, 75.0e-6),
+    "deepseek":    (0.5e-6,  1.5e-6),
+    "grok":        (1.25e-6, 2.5e-6),
+    "kimi":        (0.95e-6, 4.0e-6),
     "gpt-4o-mini": (0.15e-6, 0.60e-6),
-    "gpt-4o":      (2.50e-6, 10.0e-6),
-    "Kimi":        (0.95e-6, 4.00e-6),  # prefix-matched
 }
-_MONTHLY_CAP_USD = float(os.getenv("LLM_MONTHLY_USD_CAP", "300"))
+_TIER_PRICE = {
+    "orchestrator": _PRICING["claude-opus"],
+    "worker":       _PRICING["deepseek"],
+    "worker_kimi":  _PRICING["kimi"],
+    "utility":      _PRICING["gpt-4o-mini"],
+}
+
+_MAX_ATTEMPTS = int(os.getenv("LLM_MAX_ATTEMPTS", "6"))
+_ORCH_MAX_RETRY_SECS = float(os.getenv("LLM_ORCH_MAX_RETRY_SECS", "45"))  # then fail over, don't stall the consumer
+_RETRYABLE_STATUS = {408, 429, 500, 502, 503, 504}
+_LANE_CONCURRENCY = {
+    "orch": int(os.getenv("LLM_ORCH_CONCURRENCY", "4")),
+    "work": int(os.getenv("LLM_WORKER_CONCURRENCY", "8")),
+    "util": int(os.getenv("LLM_UTILITY_CONCURRENCY", "4")),
+}
+_sems: dict = {}
+
+
+def _sem(lane: str) -> asyncio.Semaphore:
+    if lane not in _sems:
+        _sems[lane] = asyncio.Semaphore(_LANE_CONCURRENCY.get(lane, 4))
+    return _sems[lane]
+
+
+# ── Secret scrubbing ─────────────────────────────────────────────────────────────
+_SECRETS = [s for s in (FOUNDRY_API_KEY, AZURE_API_KEY, _openai_key) if s]
+
+
+def _scrub(text: str) -> str:
+    """Strip any known API key out of a string before it can reach a log or a re-raised error.
+    The single static Foundry key fronts the whole resource and never rotates — one leaked line
+    is a full compromise."""
+    for s in _SECRETS:
+        if s:
+            text = text.replace(s, "[redacted-key]")
+    return text
+
+
+# ── Spend tracking ───────────────────────────────────────────────────────────────
+_MONTHLY_CAP_USD = float(os.getenv("LLM_MONTHLY_USD_CAP", "600"))   # monthly LLM-API cost backstop
 _SPEND_FILE = DATA_DIR / "llm_spend.json"
-
-_semaphore: asyncio.Semaphore | None = None
-
-
-def _sem() -> asyncio.Semaphore:
-    # Created lazily so it binds to the running server loop, not import time.
-    global _semaphore
-    if _semaphore is None:
-        _semaphore = asyncio.Semaphore(_MAX_CONCURRENCY)
-    return _semaphore
-
-
-def _client_for(model: str) -> OpenAI:
-    if model.startswith(("gpt-", "o1", "o3", "o4")) and _openai_client:
-        return _openai_client
-    return _azure_client
-
-
-def _price(model: str) -> tuple[float, float]:
-    for prefix, p in _PRICING.items():
-        if model.startswith(prefix):
-            return p
-    return _PRICING["Kimi"]
 
 
 def _month_key() -> str:
@@ -89,11 +152,22 @@ def _read_spend() -> dict:
         return {}
 
 
-def _record_spend(model: str, usage) -> None:
-    if usage is None:
+def _record_spend(resp, alias: str) -> None:
+    # Prefer LiteLLM's exact cost when it knows the model; otherwise price by TIER (fail-safe
+    # expensive) from usage. Never default to "cheapest" — an unknown model bills as the orchestrator.
+    cost = 0.0
+    try:
+        cost = litellm.completion_cost(completion_response=resp) or 0.0
+    except Exception:
+        cost = 0.0
+    if not cost:
+        usage = getattr(resp, "usage", None)
+        if usage:
+            pin, pout = _TIER_PRICE.get(alias, _PRICING["claude-opus"])  # unknown alias -> most expensive
+            cost = ((getattr(usage, "prompt_tokens", 0) or 0) * pin
+                    + (getattr(usage, "completion_tokens", 0) or 0) * pout)
+    if not cost:
         return
-    pin, pout = _price(model)
-    cost = (getattr(usage, "prompt_tokens", 0) or 0) * pin + (getattr(usage, "completion_tokens", 0) or 0) * pout
     try:
         data = _read_spend()
         mk = _month_key()
@@ -103,7 +177,6 @@ def _record_spend(model: str, usage) -> None:
         data[mk] = month
         _SPEND_FILE.parent.mkdir(parents=True, exist_ok=True)
         _SPEND_FILE.write_text(json.dumps(data))
-        # Warn once when crossing 80% of the cap.
         if before < _MONTHLY_CAP_USD * 0.8 <= month["usd"]:
             log.warning("llm_spend_80pct", month=mk, usd=round(month["usd"], 2), cap=_MONTHLY_CAP_USD)
     except Exception:
@@ -116,6 +189,15 @@ def _over_cap() -> bool:
     return _read_spend().get(_month_key(), {}).get("usd", 0.0) >= _MONTHLY_CAP_USD
 
 
+def spend_summary() -> str:
+    usd = _read_spend().get(_month_key(), {}).get("usd", 0.0)
+    return f"LLM spend this month: ${usd:.2f} / ${_MONTHLY_CAP_USD:.0f} cap"
+
+
+class BudgetExceeded(RuntimeError):
+    """Raised when the monthly LLM spend cap is hit — a runaway backstop."""
+
+
 def _status_of(exc) -> int | None:
     code = getattr(exc, "status_code", None)
     if isinstance(code, int):
@@ -125,60 +207,111 @@ def _status_of(exc) -> int | None:
     return code if isinstance(code, int) else None
 
 
+def _retryable(exc, status) -> bool:
+    return status in _RETRYABLE_STATUS or isinstance(exc, _RETRYABLE_EXC)
+
+
 def _retry_after_seconds(exc) -> float | None:
     resp = getattr(exc, "response", None)
     headers = getattr(resp, "headers", None)
     if not headers:
         return None
-    ms = headers.get("retry-after-ms")
-    if ms:
-        try:
-            return float(ms) / 1000.0
-        except ValueError:
-            pass
-    secs = headers.get("retry-after")
-    if secs:
-        try:
-            return float(secs)
-        except ValueError:
-            pass
+    for key in ("retry-after-ms",):
+        v = headers.get(key)
+        if v:
+            try:
+                return float(v) / 1000.0
+            except ValueError:
+                pass
+    for key in ("retry-after", "x-ratelimit-reset"):
+        v = headers.get(key)
+        if v:
+            try:
+                return float(v)
+            except ValueError:
+                pass
     return None
 
 
-class BudgetExceeded(RuntimeError):
-    """Raised when the monthly LLM spend cap is hit — a runaway backstop."""
+def _strip_reasoning(messages: list[dict]) -> list[dict]:
+    """reasoning_content is a Kimi-only round-trip field. For any other model (Opus, DeepSeek)
+    it's noise at best and breaks the Anthropic translation at worst — Kimi-era history carries
+    it, so drop it for non-Kimi tiers. tool_calls and every other field are kept."""
+    if not any(m.get("reasoning_content") for m in messages):
+        return messages
+    return [{k: v for k, v in m.items() if k != "reasoning_content"} for m in messages]
 
 
-async def llm_create(**kwargs):
-    """Resilient chat.completions.create: provider routing + shared concurrency cap +
-    backoff on 429/5xx + spend tracking.
+async def _attempt_tier(alias: str, kwargs: dict):
+    """Run one tier's call with retries (status + connection/timeout), per-lane concurrency,
+    and a wall-time cap for the orchestrator so a 429 storm fails over instead of stalling the
+    single consumer. Raises the last error if it can't succeed."""
+    tier = _TIERS.get(alias) or _TIERS["worker"]
+    if not tier.get("api_key"):
+        raise RuntimeError(f"[llm] tier '{alias}' has no API key configured — check FOUNDRY_API_KEY / AZURE_API_KEY")
 
-    Routes by `model` (gpt-* → OpenAI, else Kimi/Azure). Retryable failures (429/5xx)
-    retry up to _MAX_ATTEMPTS with Retry-After-aware backoff. Non-retryable errors
-    (e.g. 400) raise immediately. Raises BudgetExceeded if the monthly cap is hit."""
-    model = kwargs.get("model", MODEL)
-    if _over_cap():
-        log.error("llm_budget_cap_reached", month=_month_key(), cap=_MONTHLY_CAP_USD)
-        raise BudgetExceeded(f"Monthly LLM spend cap (${_MONTHLY_CAP_USD}) reached — pausing LLM calls.")
-    client = _client_for(model)
+    call = dict(kwargs)
+    call["model"] = tier["model"]
+    if tier.get("api_base"):
+        call["api_base"] = tier["api_base"]
+    call["api_key"] = tier["api_key"]
+    call["num_retries"] = 0  # we own retries
+    call.setdefault("max_tokens", 8192)  # Foundry's Claude surface rejects calls without it
+    if "kimi" not in tier["model"].lower() and call.get("messages"):
+        call["messages"] = _strip_reasoning(call["messages"])
+
+    sem = _sem(tier["lane"])
+    started = time.monotonic()
     for attempt in range(_MAX_ATTEMPTS):
         try:
-            async with _sem():
-                resp = await asyncio.to_thread(client.chat.completions.create, **kwargs)
-            _record_spend(model, getattr(resp, "usage", None))
+            async with sem:
+                resp = await litellm.acompletion(**call)
+            _record_spend(resp, alias)
             return resp
         except Exception as e:
             status = _status_of(e)
-            if status not in _RETRYABLE_STATUS or attempt == _MAX_ATTEMPTS - 1:
+            last = attempt == _MAX_ATTEMPTS - 1
+            if not _retryable(e, status) or last:
                 raise
             delay = _retry_after_seconds(e)
-        if delay is None:
-            delay = min(2 ** attempt + random.uniform(0, 1), 30.0)
-        log.warning("llm_retry", model=model, status=status, attempt=attempt + 1, delay=round(delay, 1))
-        await asyncio.sleep(delay)
+            if delay is None:
+                delay = min(2 ** attempt + random.uniform(0, 1), 30.0)
+            # The orchestrator runs on the single consumer — don't let a 429 storm stall the
+            # whole queue; bail to the failover path once we've spent the retry budget.
+            if tier["lane"] == "orch" and (time.monotonic() - started) + delay > _ORCH_MAX_RETRY_SECS:
+                raise
+            log.warning("llm_retry", tier=alias, status=status,
+                        err=type(e).__name__, attempt=attempt + 1, delay=round(delay, 1))
+            await asyncio.sleep(delay)
 
 
-def spend_summary() -> str:
-    """Human-readable current-month LLM spend (for a status tool/endpoint)."""
-    usd = _read_spend().get(_month_key(), {}).get("usd", 0.0)
-    return f"LLM spend this month: ${usd:.2f} / ${_MONTHLY_CAP_USD:.0f} cap"
+async def llm_create(**kwargs):
+    """Resilient tiered chat completion via LiteLLM. `model` is a TIER alias
+    (orchestrator | worker | utility | worker_kimi); resolved to the real deployment + endpoint.
+    On a Foundry availability/auth failure of the orchestrator or worker tier, fails over once to
+    Kimi so the loop stays up. Raises BudgetExceeded at the monthly cap."""
+    alias = kwargs.pop("model", "worker")
+    if _over_cap():
+        log.error("llm_budget_cap_reached", month=_month_key(), cap=_MONTHLY_CAP_USD)
+        raise BudgetExceeded(f"Monthly LLM spend cap (${_MONTHLY_CAP_USD}) reached — pausing LLM calls.")
+    try:
+        return await _attempt_tier(alias, kwargs)
+    except BudgetExceeded:
+        raise
+    except Exception as e:
+        status = _status_of(e)
+        # A 400 is a request problem (e.g. context overflow) — the caller handles that, don't
+        # fail over (Kimi would 400 too). Anything else on a Foundry tier sheds to Kimi.
+        can_failover = (
+            status != 400
+            and alias in ("orchestrator", "worker")
+            and _TIERS.get("worker_kimi", {}).get("api_key")
+            and _TIERS["worker_kimi"]["api_base"] != _TIERS[alias].get("api_base")
+        )
+        if can_failover:
+            log.warning("foundry_failover_to_kimi", tier=alias, status=status, err=type(e).__name__)
+            try:
+                return await _attempt_tier("worker_kimi", kwargs)
+            except Exception as e2:
+                raise RuntimeError(_scrub(f"[LLM error] {alias} failed and Kimi failover failed: {e2}")) from None
+        raise RuntimeError(_scrub(f"[LLM error] {type(e).__name__}: {e}")) from None

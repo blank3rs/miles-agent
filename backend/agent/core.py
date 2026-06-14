@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import json
+import os
 import time
 from collections import deque
 from datetime import datetime, timezone
@@ -8,26 +9,28 @@ from typing import Callable
 
 import structlog
 
-from .config import AGENT_STATE_FILE, LOGS_DIR, MODEL
-from .llm import UTILITY_MODEL, llm_create
-from .persona import build_system_prompt
-from .tools import TOOL_DEFINITIONS, TOOL_HANDLERS
+from agent import scribe, store
+from agent.config import AKSHAY_EMAIL, LOGS_DIR, ORCHESTRATOR_MODEL, WORKER_MODEL
+from agent.llm import UTILITY_MODEL, llm_create
+from agent.persona import build_system_prompt
+from agent.tools import TOOL_DEFINITIONS, TOOL_HANDLERS
 
 log = structlog.get_logger()
 
-# Kimi K2.6 has 262,144 token context window.
-# Rough heuristic: 1 token ≈ 4 chars.
-CTX_WINDOW_TOKENS = 262_144
-COMPACT_AT_TOKENS = int(CTX_WINDOW_TOKENS * 0.50)   # ~131k — trigger
-COMPACT_TO_TOKENS = int(CTX_WINDOW_TOKENS * 0.20)   # ~52k — keep recent verbatim
-CHARS_PER_TOKEN   = 4
-
-# Not a work limit — Miles runs as long as he wants and stops when he's done (or
-# chooses to take a break and set a heartbeat). This is only a runaway backstop so a
-# stuck loop can't burn the budget overnight. In-turn compaction keeps context healthy
-# however long the turn runs.
+# Not a work limit — Miles runs as long as he wants and stops when he's done. This is only
+# a runaway backstop so a stuck loop can't burn the budget overnight. In-turn compaction
+# (_compact_tool_results) keeps context healthy however long a single turn runs; across
+# turns, store.compile_context() rebuilds a bounded window from the source of truth.
 MAX_TOOL_ROUNDS = 1000
 NUDGE_AT_ROUND  = 990  # only fires if approaching the runaway backstop — never in normal work
+
+# Orchestrator (Opus on Foundry) is a 200k-token window and Foundry counts the output
+# reservation against it — so size the output budget to what's left, and keep in-turn growth
+# under a char ceiling that leaves room for the tool catalog + system prompt + output.
+CHARS_PER_TOKEN     = 4
+ORCH_CTX_TOKENS     = int(os.getenv("ORCH_CTX_TOKENS", "200000"))
+_OUTPUT_RESERVE_MAX = 32768
+_TOOLS_SYSTEM_MARGIN_TOKENS = 6000   # tools=TOOL_DEFINITIONS + headroom, not counted in messages
 
 WRAPUP_NUDGE = (
     "[system] You've been going a very long time on this single turn — that's unusual. "
@@ -35,48 +38,36 @@ WRAPUP_NUDGE = (
     "if work remains, and reply with a brief status. Don't start anything new."
 )
 
-COMPACT_PROMPT = """You are compacting an autonomous CMO agent's conversation history so it can keep operating with full working context. This summary REPLACES the raw history, so anything you drop is gone forever — losing a specific (a name, a number, a commitment) is far worse than being verbose.
-
-The history below is ordered oldest → newest. Recent events matter more.
-
-Fill in this exact structure, keeping every concrete specific. Omit a section only if it's genuinely empty:
-
-PEOPLE & ORGS: every person/company involved — name, role/company, current state of the relationship, what was last discussed.
-COMMITMENTS & PROMISES: anything the agent committed to (or others committed to it), with who and by when.
-ACTIONS TAKEN: emails sent, calls made, things scheduled, purchases, profile/account changes — with outcomes.
-DECISIONS: what was decided and the reasoning; alternatives rejected.
-OPEN THREADS / FOLLOW-UPS: what's still pending, blocked, or waiting on someone — be specific about next step.
-SCHEDULED: active heartbeats, calls, deadlines, dates.
-LESSONS / GOTCHAS: anything that broke and what fixed it; anything surprising.
-ACTIVE NOW: the thread the agent was working on most recently — extra detail here.
-
-Drop only: reasoning narration, redundant restatement, and pleasantries. Never drop a concrete fact to be brief. Plain prose under each label is fine; no markdown headers.
-
----
-{history}
----
-
-Compacted context:"""
-
-
-def _estimate_tokens(messages: list[dict]) -> int:
-    total_chars = sum(
-        len(str(m.get("content") or "")) + len(str(m.get("role") or ""))
-        for m in messages
-    )
-    return total_chars // CHARS_PER_TOKEN
+# Cost control: the premium orchestrator (Opus) runs only the turns that warrant it; the rest
+# run on the cheap worker. A tiny utility-model triage decides the ambiguous (external) cases.
+_IMPORTANCE_PROMPT = (
+    "You triage incoming work for an autonomous CMO agent and decide if it needs the TOP-TIER "
+    "model. Answer 'important' for: a real decision or judgment call; a serious reply from a "
+    "customer, partner, investor, or press; anything about money, pricing, contracts, legal, or a "
+    "deal moving; or anything high-stakes. Answer 'routine' for: a bounce or auto-reply, a "
+    "newsletter or notification, cold-outreach legwork, scheduling, research, or admin. "
+    "Reply with exactly one word: important or routine."
+)
 
 
 class Agent:
+    """The waking agent. State is NOT held here — it lives in the store (miles.db). Each
+    turn compiles a fresh context from the store and writes new messages straight back, so
+    a restart mid-thought resumes cleanly: there is no separate 'load state' path, a cold
+    boot compiles exactly like any other turn."""
+
     def __init__(self):
-        self.model = MODEL
-        self.history: deque = deque(maxlen=500)
-        self.summary: str = ""
+        self.model = ORCHESTRATOR_MODEL   # the main loop runs on the orchestrator tier (Opus)
         self.broadcast: Callable | None = None
         self.is_running: bool = False
         # Set by inbox_watcher when Akshay emails mid-run; cleared after injection
         self._akshay_interrupt: dict | None = None
-        self._load_state()
+        # After a restart, warn Miles to re-check reality before acting on an in-flight task
+        # (did the last step's side effect already land?). We inject it on the first of the
+        # next few turns that actually has an in-flight task — not just the literal first turn,
+        # which might be a trivial heartbeat that would waste the one-shot.
+        self._boot_turns_left: int = 3
+        store.init_db()
 
     def interrupt_for_akshay(self, email: dict) -> None:
         """Called from inbox_watcher when Akshay emails while the agent is busy.
@@ -95,65 +86,129 @@ class Agent:
             f"Wrap up what you're doing cleanly so you can get to it — don't reply to it here."
         )
 
-    # ── Durable state ──────────────────────────────────────────────────────────
-    # Working memory (history + summary) survives restarts. The graph and soul
-    # are reflective memory; this is the operational thread Miles was on.
+    @staticmethod
+    def _resume_note(active_task: dict) -> str:
+        return (
+            "\n\n## You just restarted — re-check reality before acting\n"
+            f"Your active task was: {active_task['title']} (status {active_task['status']}). "
+            f"Last step recorded: {active_task.get('last_step') or '(none)'}.\n"
+            "Background work (browser_task, run_subagent) does NOT survive a restart. Before you "
+            "do anything that has a side effect, confirm the current state — read the inbox, check "
+            "the relevant page or file, search_memories() — so you continue from where things "
+            "actually are, not where you assumed. Don't redo a step that already completed, and "
+            "don't re-send something that already went out."
+        )
 
-    def _load_state(self) -> None:
-        try:
-            if AGENT_STATE_FILE.exists():
-                data = json.loads(AGENT_STATE_FILE.read_text())
-                self.history.extend(data.get("history", []))
-                self.summary = data.get("summary", "")
-                log.info("agent_state_loaded", messages=len(self.history))
-        except Exception as e:
-            log.warning("agent_state_load_failed", err=str(e))
+    # ── Model routing (cost control) ────────────────────────────────────────────
 
-    def _save_state(self) -> None:
+    async def _is_important(self, message: str) -> bool:
+        """Cheap utility-model triage: does this external item warrant the premium model?
+        Fails safe to routine (worker) so a classifier hiccup never burns Opus."""
         try:
-            AGENT_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-            tmp = AGENT_STATE_FILE.with_suffix(".tmp")
-            tmp.write_text(json.dumps({"history": list(self.history), "summary": self.summary}))
-            tmp.replace(AGENT_STATE_FILE)  # atomic — a crash mid-write can't corrupt state
-        except Exception as e:
-            log.warning("agent_state_save_failed", err=str(e))
+            resp = await llm_create(
+                model=UTILITY_MODEL,
+                messages=[
+                    {"role": "system", "content": _IMPORTANCE_PROMPT},
+                    {"role": "user", "content": (message or "")[:2000]},
+                ],
+                max_tokens=4,
+                temperature=0,
+            )
+            ans = (resp.choices[0].message.content or "").strip().lower()
+            return ans.startswith("important") or ans.startswith("yes")
+        except Exception:
+            return False
+
+    async def _pick_tier(self, trigger: str, user_message: str) -> str:
+        """Route the turn to a model by importance. Opus only for the founder and genuinely
+        high-stakes work; everything else (heartbeats, routine outreach, bounces, research,
+        dispatch results) runs on the cheap worker."""
+        t = (trigger or "").lower()
+        if t == "user" or (AKSHAY_EMAIL and AKSHAY_EMAIL.lower() in t):
+            tier = ORCHESTRATOR_MODEL                      # the founder is always top-tier
+        elif t.startswith(("email:", "call:")):
+            tier = ORCHESTRATOR_MODEL if await self._is_important(user_message) else WORKER_MODEL
+        else:
+            tier = WORKER_MODEL                            # heartbeats, dispatch results, etc.
+        log.info("turn_tier", tier=tier, trigger=trigger)
+        await self._emit("status", {"status": "tier", "message": tier})
+        return tier
 
     # ── Public entry point ─────────────────────────────────────────────────────
 
     async def run(self, user_message: str, trigger: str = "user") -> str:
         self.is_running = True
         # A heads-up that arrived between turns is stale — the email it points to is
-        # separately queued and will be (or is being) handled as its own turn. Drop it
-        # so it can't be injected into an unrelated future turn.
+        # separately queued and handled as its own turn.
         self._akshay_interrupt = None
         try:
             await self._emit("start", {"trigger": trigger, "message": user_message})
-            self.history.append({"role": "user", "content": user_message})
-            # Persist the trigger immediately so a deploy/kill mid-turn can't silently
-            # lose the email or request we're about to work on.
-            self._save_state()
 
-            await self._maybe_compact()
+            # Pick the model for THIS turn: premium (Opus) for the founder + high-stakes work,
+            # cheap worker for everything routine. Keeps the always-on burn off the premium tier.
+            self.model = await self._pick_tier(trigger, user_message)
+
+            # Persist the trigger immediately — a deploy/kill mid-turn can't lose the
+            # request we're about to work on, because it's already in the log. The id marks
+            # where this turn begins, so the scribe can read exactly it afterwards.
+            turn_start_id = store.append_message({"role": "user", "content": user_message}, trigger=trigger)
+
+            ctx = store.compile_context()
 
             system_prompt = build_system_prompt()
-            if self.summary:
-                system_prompt += f"\n\n## Compressed history\n{self.summary}"
+            if ctx["system_context"]:
+                system_prompt += "\n\n" + ctx["system_context"]
 
-            messages = [{"role": "system", "content": system_prompt}] + list(self.history)
+            # Within the first few turns after a restart, the first time Miles actually has an
+            # in-flight task, tell him to verify before acting. Then stop (warned once); and if
+            # the boot window passes with nothing in flight, stop too (no longer "just restarted").
+            if self._boot_turns_left > 0:
+                self._boot_turns_left -= 1
+                active = ctx["resume"].get("active_task")
+                if active and active.get("status") in ("in_progress", "blocked"):
+                    system_prompt += self._resume_note(active)
+                    self._boot_turns_left = 0
+
+            messages = [{"role": "system", "content": system_prompt}] + ctx["history"]
 
             result = await self._tool_loop(messages)
 
-            self.history.append({"role": "assistant", "content": result})
+            store.append_message({"role": "assistant", "content": result})
+
+            # Hand the finished turn to the scribe — it records what happened (episodes +
+            # an updated checkpoint) so Miles never has to journal or set focus by hand.
+            # Background + best-effort: it must never slow the reply or break the turn.
+            try:
+                turn_msgs = store.messages_since(turn_start_id)
+                asyncio.create_task(scribe.record_turn(trigger, turn_msgs))
+            except Exception as e:
+                log.warning("scribe_dispatch_failed", err=str(e))
+
             return result
         finally:
             self.is_running = False
-            self._save_state()
 
     # ── Tool loop ──────────────────────────────────────────────────────────────
 
     @staticmethod
+    def _msg_size(m: dict) -> int:
+        """Char weight of a message — content + reasoning + tool_call ARGUMENTS (a long
+        write_report / email arg can be the bulk of a turn, so it must count)."""
+        s = len(str(m.get("content") or "")) + len(str(m.get("reasoning_content") or ""))
+        for tc in (m.get("tool_calls") or []):
+            s += len(str(tc.get("function", {}).get("arguments") or ""))
+        return s
+
+    @classmethod
+    def _output_budget(cls, messages: list[dict]) -> int:
+        """How many output tokens we can safely ask for without prompt+output blowing the
+        orchestrator's 200k window (Foundry counts the reservation against it)."""
+        prompt_tokens = sum(cls._msg_size(m) for m in messages) // CHARS_PER_TOKEN + _TOOLS_SYSTEM_MARGIN_TOKENS
+        return max(2048, min(_OUTPUT_RESERVE_MAX, ORCH_CTX_TOKENS - prompt_tokens))
+
+    @classmethod
     def _compact_tool_results(
-        messages: list[dict], max_chars: int = 600_000, keep_recent: int = 6
+        cls, messages: list[dict], max_chars: int = 360_000, keep_recent: int = 6
     ) -> list[dict]:
         """In-turn Tier-1 compaction (Claude-Code style): when a single turn's history
         balloons past max_chars, *clear* old bulk rather than truncate it. This is what
@@ -165,10 +220,9 @@ class Agent:
           - old assistant reasoning_content (Kimi's thinking, which accumulates fast) →
             dropped; it only needs to round-trip for the recent turns, not ancient ones
         Truncating mid-string corrupts JSON/HTML and still costs tokens, so we clear whole
-        fields. Between-turn summarization is handled separately by _maybe_compact."""
-        def _size(m):
-            return len(str(m.get("content") or "")) + len(str(m.get("reasoning_content") or ""))
-        total = sum(_size(m) for m in messages)
+        fields. This is the IN-turn safety net; across turns, store.compile_context bounds
+        the window from the source of truth."""
+        total = sum(cls._msg_size(m) for m in messages)
         if total <= max_chars:
             return messages
         out = [dict(m) for m in messages]
@@ -190,12 +244,51 @@ class Agent:
                     marker = f"[old tool result cleared — was {len(content):,} chars]"
                     out[i] = {**m, "content": marker}
                     total -= len(content) - len(marker)
+            # A turn's bulk can live in a large tool-call argument (write_report, a long email
+            # body) — shed those from old calls too; the durable log keeps the real call.
+            if total > max_chars and m.get("tool_calls"):
+                new_tcs, changed = [], False
+                for tc in m["tool_calls"]:
+                    args = str(tc.get("function", {}).get("arguments") or "")
+                    if len(args) > 600:
+                        marker = '{"_cleared": "large argument dropped to fit context"}'
+                        new_tcs.append({**tc, "function": {**tc["function"], "arguments": marker}})
+                        total -= len(args) - len(marker)
+                        changed = True
+                    else:
+                        new_tcs.append(tc)
+                if changed:
+                    out[i] = {**out[i], "tool_calls": new_tcs}
         return out
 
     # Secret values must never reach the event log or the websocket feed —
     # the model still gets the real result, only the emitted copy is redacted.
     _SECRET_RESULT_TOOLS = frozenset({"get_secret"})
     _SECRET_PARAM_TOOLS  = frozenset({"store_secret"})
+
+    @classmethod
+    def _redact_assistant_for_store(cls, m: dict) -> dict:
+        """Strip secret-bearing tool-call arguments (e.g. store_secret's value) before the
+        message reaches the durable log. The live in-turn messages keep the real values, so
+        this turn still works; the DB never holds the secret."""
+        tcs = m.get("tool_calls")
+        if not tcs or not any(tc["function"]["name"] in cls._SECRET_PARAM_TOOLS for tc in tcs):
+            return m
+        red = [
+            {**tc, "function": {**tc["function"], "arguments": '{"redacted": true}'}}
+            if tc["function"]["name"] in cls._SECRET_PARAM_TOOLS else tc
+            for tc in tcs
+        ]
+        return {**m, "tool_calls": red}
+
+    @classmethod
+    def _redact_tool_for_store(cls, tm: dict, name_by_id: dict) -> dict:
+        """Redact secret tool RESULTS (e.g. get_secret) before the durable log — so secrets
+        are never persisted in miles.db and never reach the scribe's external utility model.
+        The model still got the real value live, in-turn."""
+        if name_by_id.get(tm.get("tool_call_id")) in cls._SECRET_RESULT_TOOLS:
+            return {**tm, "content": "[redacted — secret value, not stored]"}
+        return tm
 
     async def _exec_tool(self, tool_call) -> dict:
         name = tool_call.function.name
@@ -236,8 +329,7 @@ class Agent:
 
     async def _tool_loop(self, messages: list[dict]) -> str:
         # Out-of-model loop detection: if the model fires the exact same tool call(s)
-        # over and over with no progress, a circuit breaker stops the turn. Matters more
-        # now that 429s retry instead of dying — a stuck loop could otherwise run forever.
+        # over and over with no progress, a circuit breaker stops the turn.
         recent_fps: deque = deque(maxlen=6)
         loop_warned = False
         for round_num in range(MAX_TOOL_ROUNDS):
@@ -258,21 +350,22 @@ class Agent:
                     messages=send_messages,
                     tools=TOOL_DEFINITIONS,
                     tool_choice="auto",
-                    max_tokens=32768,
+                    max_tokens=self._output_budget(send_messages),
                 )
             except Exception as e:
-                # 429/5xx were already retried with backoff inside llm_create. A 400 here
-                # is usually context overflow — trim hard and try once more.
-                if "400" in str(e):
+                # 429/5xx + connection errors were already retried (and failed over) inside
+                # llm_create. A 400 here is usually context overflow — trim HARD, shrink the
+                # output reservation, and try once more so a long turn doesn't fail closed.
+                if "400" in str(e) or "context" in str(e).lower():
                     await self._emit("status", {"status": "retrying", "message": "400 — trimming context and retrying"})
                     try:
-                        send_messages = self._compact_tool_results(messages, max_chars=200_000)
+                        send_messages = self._compact_tool_results(messages, max_chars=140_000)
                         response = await llm_create(
                             model=self.model,
                             messages=send_messages,
                             tools=TOOL_DEFINITIONS,
                             tool_choice="auto",
-                            max_tokens=32768,
+                            max_tokens=8192,
                         )
                     except Exception as e2:
                         err = f"[LLM error after retry] {e2}"
@@ -288,6 +381,7 @@ class Agent:
 
             # Output hit the token cap mid-generation: don't treat a truncated reply as
             # final, and don't run possibly-malformed tool calls — continue it instead.
+            # (Transient — not persisted to the log.)
             if choice.finish_reason == "length":
                 await self._emit("status", {"status": "truncated", "message": "Hit token cap mid-reply — continuing"})
                 messages.append({"role": "assistant", "content": msg.content or ""})
@@ -332,6 +426,9 @@ class Agent:
                 if rc:
                     assistant_msg["reasoning_content"] = rc
                 messages.append(assistant_msg)
+                # Persist as it happens (survives a mid-turn crash), with any secret tool-call
+                # argument stripped so it's never at rest in the log.
+                store.append_message(self._redact_assistant_for_store(assistant_msg))
 
                 # Tools in one round are independent — run them concurrently.
                 # This is what makes "fire several subagents at once" actually parallel.
@@ -339,6 +436,9 @@ class Agent:
                     *[self._exec_tool(tc) for tc in msg.tool_calls]
                 )
                 messages.extend(tool_msgs)
+                name_by_id = {tc.id: tc.function.name for tc in msg.tool_calls}
+                for tm in tool_msgs:
+                    store.append_message(self._redact_tool_for_store(tm, name_by_id))
 
                 # Near the round cap: tell the agent to land the turn instead of
                 # silently dropping it at the limit.
@@ -355,79 +455,6 @@ class Agent:
             "[agent] Hit maximum tool call depth. Work state was saved to the task "
             "ledger if I updated it; continuing on the next heartbeat."
         )
-
-    # ── Context compaction ────────────────────────────────────────────────────
-
-    async def _maybe_compact(self):
-        history_list = list(self.history)
-        estimated = _estimate_tokens(history_list)
-
-        if estimated <= COMPACT_AT_TOKENS:
-            return
-
-        await self._emit("status", {
-            "status": "compacting",
-            "message": f"Context at ~{estimated:,} tokens ({estimated*100//CTX_WINDOW_TOKENS}% of window) — compacting…",
-        })
-
-        # Keep the most recent messages worth ~COMPACT_TO_TOKENS; summarize the rest
-        target_chars = COMPACT_TO_TOKENS * CHARS_PER_TOKEN
-        chars_so_far = 0
-        keep_from    = len(history_list)
-
-        for i in range(len(history_list) - 1, -1, -1):
-            msg_chars = len(str(history_list[i].get("content") or ""))
-            if chars_so_far + msg_chars > target_chars:
-                keep_from = i + 1
-                break
-            chars_so_far += msg_chars
-
-        old_messages  = history_list[:keep_from]
-        keep_messages = history_list[keep_from:]
-
-        if not old_messages:
-            return
-
-        # Build history text — mark the bottom third as recent for the summarizer
-        recent_cutoff = max(0, len(old_messages) - len(old_messages) // 3)
-        lines = []
-        for i, m in enumerate(old_messages):
-            if not m.get("content"):
-                continue
-            prefix = "[RECENT] " if i >= recent_cutoff else ""
-            lines.append(f"{prefix}{m['role'].upper()}: {str(m.get('content',''))[:600]}")
-        history_text = "\n".join(lines)
-        if self.summary:
-            history_text = f"[Prior summary]\n{self.summary}\n\n[New messages]\n{history_text}"
-
-        prompt = COMPACT_PROMPT.format(history=history_text)
-
-        try:
-            # Cheap utility model (gpt-4o-mini) — summarization doesn't need Kimi, and
-            # routing it off-Kimi frees scarce quota for the actual work.
-            resp = await llm_create(
-                model=UTILITY_MODEL,
-                messages=[
-                    {"role": "system", "content": "You are a precise summarizer for an AI agent's context window."},
-                    {"role": "user",   "content": prompt},
-                ],
-                max_tokens=4096,
-            )
-            new_summary = resp.choices[0].message.content or ""
-        except Exception as e:
-            await self._emit("status", {"status": "compact_failed", "message": f"Compaction failed: {e}"})
-            # Fall back to hard truncation — better than crashing
-            self.history = deque(keep_messages, maxlen=500)
-            return
-
-        self.summary = new_summary
-        self.history = deque(keep_messages, maxlen=500)
-
-        compressed_tokens = _estimate_tokens(list(self.history))
-        await self._emit("status", {
-            "status":  "compact_done",
-            "message": f"Compacted to ~{compressed_tokens:,} tokens. Summary stored.",
-        })
 
     # ── Internals ──────────────────────────────────────────────────────────────
 

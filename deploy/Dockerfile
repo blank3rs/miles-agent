@@ -22,8 +22,16 @@ COPY backend/pyproject.toml backend/uv.lock ./
 RUN uv sync --no-install-project --frozen
 
 # Playwright Chromium (--with-deps installs any remaining system packages).
-# browser-use drives this same Chromium.
+# browser-use drives this same Chromium; web_cli launches it HEADFUL on the Xvfb display
+# (DISPLAY=:99, started by CMD) in CDP mode for OpenCLI — a real browser, not a flagged one.
 RUN uv run playwright install chromium --with-deps
+
+# Node 20 + OpenCLI — web_cli() shells out to `opencli` against headless Chromium (CDP mode)
+# to turn any website into a reusable CLI. Adapters persist under /data/opencli_home.
+RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && npm install -g @jackwener/opencli \
+    && rm -rf /var/lib/apt/lists/*
 
 # Application code
 COPY backend/agent/ ./agent/

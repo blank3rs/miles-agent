@@ -39,8 +39,8 @@ if _sys.platform.startswith("linux"):
             "Add KEYRING_PASSWORD to your .env file."
         )
 
-from agent import runtime
-from agent.config import DATA_DIR, HEARTBEATS_DIR, KEYRING_SERVICE, PLAYBOOKS_DIR, SKILLS_DIR, SOUL_FILE, TASKS_FILE
+from agent import runtime, store
+from agent.config import DATA_DIR, HEARTBEATS_DIR, KEYRING_SERVICE, PLAYBOOKS_DIR, SKILLS_DIR, SOUL_FILE
 from agent.core import Agent
 from agent.tools import cancel_heartbeat
 
@@ -215,13 +215,64 @@ def _enqueue_heartbeat(hb: dict) -> None:
     if hid and hid in _inflight_heartbeats:
         log.info("heartbeat_deduped", id=hid)
         return
+    # Mark in-flight only AFTER a successful enqueue. If _enqueue raises (e.g. the loop is
+    # closing at shutdown), a poisoned id would otherwise dedup-drop that pulse forever.
+    try:
+        _enqueue(hb)
+    except Exception as e:
+        log.warning("heartbeat_enqueue_failed", id=hid, err=str(e))
+        return
     if hid:
         _inflight_heartbeats.add(hid)
-    _enqueue(hb)
 
 
 # Let the voice bridge hand call outcomes back to text-Miles through the same queue.
 runtime.enqueue_task = _enqueue
+
+
+# Single-writer lease: an inbound call pauses the text loop so it isn't mutating shared
+# state under the conversation. Set = free to work; cleared = paused. The lease has a TTL
+# so a dropped/never-closed call can't deadlock Miles forever.
+_agent_gate = asyncio.Event()
+_agent_gate.set()
+_gate_lease_until: float = 0.0
+_GATE_MAX_LEASE = 1800.0  # 30 min — longer than any real call
+
+
+def _pause_agent(reason: str = "call") -> None:
+    global _gate_lease_until
+    _gate_lease_until = time.time() + _GATE_MAX_LEASE
+    _agent_gate.clear()
+    log.info("agent_paused", reason=reason)
+
+
+def _resume_agent() -> None:
+    global _gate_lease_until
+    _gate_lease_until = 0.0
+    _agent_gate.set()
+    log.info("agent_resumed")
+
+
+async def _await_gate() -> None:
+    """Block while paused for a live call — but never past the lease TTL."""
+    while not _agent_gate.is_set():
+        if time.time() >= _gate_lease_until:
+            log.warning("agent_gate_lease_expired", note="resuming despite no explicit release")
+            _resume_agent()
+            return
+        try:
+            await asyncio.wait_for(_agent_gate.wait(), timeout=5.0)
+        except asyncio.TimeoutError:
+            continue
+
+
+runtime.pause_agent = _pause_agent
+runtime.resume_agent = _resume_agent
+
+# Serializes anything that mutates agent memory state — a turn (agent.run) and the idle
+# memory consolidation (dream). The single consumer already serializes turns with each other;
+# this lock additionally keeps the background consolidator from racing a live turn.
+_turn_lock = asyncio.Lock()
 
 
 # ── WebSocket connection manager ───────────────────────────────────────────────
@@ -315,6 +366,10 @@ runtime.scheduler = scheduler
 async def agent_consumer():
     while True:
         task = await agent_queue.get()
+        # If Miles is on a call, hold each turn at the boundary until the call ends — work
+        # stays queued and runs in order on resume, against the now-updated state.
+        await _await_gate()
+        await _turn_lock.acquire()  # block the idle consolidator from dreaming under a live turn
         try:
             if task["type"] == "heartbeat":
                 await manager.broadcast({"type": "heartbeat_fired", "id": task["id"], "reason": task["reason"]})
@@ -344,6 +399,7 @@ async def agent_consumer():
             # processing all emails and heartbeats until restart.
             log.error("agent_consumer_error", task_type=task.get("type"), err=str(e), exc_info=True)
         finally:
+            _turn_lock.release()
             if task.get("type") == "heartbeat":
                 _inflight_heartbeats.discard(task.get("id", ""))
 
@@ -352,6 +408,10 @@ async def agent_consumer():
 
 _SEEN_HISTORY_FILE = DATA_DIR / "last_gmail_history.txt"
 EMAIL_POLL_INTERVAL = 60  # seconds
+# Backstop against stale mail re-entering the inbox (a thread gets bumped, an old
+# message un-archived) being handled as if it just arrived. internalDate older than
+# this is never "new mail." Generous enough not to drop a normal downtime catch-up.
+_EMAIL_MAX_AGE_SECONDS = int(os.getenv("EMAIL_MAX_AGE_SECONDS", str(24 * 3600)))
 
 
 def _fetch_new_emails() -> list[dict]:
@@ -381,11 +441,15 @@ def _fetch_new_emails() -> list[dict]:
 
         pending_history_id = None  # advanced only AFTER messages are fetched (below)
         if not last_history_id:
-            # First run: snapshot current historyId, return recent inbox messages
+            # First run (or a lost watermark): snapshot the current historyId and surface
+            # NOTHING. The inbox already sitting there isn't "new mail that just arrived" —
+            # only messages added AFTER this baseline are. Replaying the latest 5 here is what
+            # made Miles re-handle (and re-brief Akshay about) weeks-old threads on every cold
+            # start. From now on a fresh start just establishes the baseline and waits.
             profile = service.users().getProfile(userId="me").execute()
             _SEEN_HISTORY_FILE.write_text(str(profile["historyId"]))
-            result = service.users().messages().list(userId="me", maxResults=5, q="in:inbox").execute()
-            msg_ids = [m["id"] for m in result.get("messages", [])]
+            log.info("gmail_watch_baselined", history_id=profile["historyId"])
+            return []
         else:
             try:
                 history = service.users().history().list(
@@ -416,10 +480,23 @@ def _fetch_new_emails() -> list[dict]:
                     if "INBOX" in added["message"].get("labelIds", []):
                         msg_ids.append(added["message"]["id"])
 
+        # Fetch EVERY new message, not just the newest 10 — we advance the watermark past
+        # this whole batch below, so anything we skip here would be lost for good (a burst, a
+        # post-downtime backlog, a newsletter blast). Dedup by id preserves order.
         emails = []
-        for msg_id in msg_ids[-10:]:
+        for msg_id in list(dict.fromkeys(msg_ids)):
             try:
                 msg = service.users().messages().get(userId="me", id=msg_id, format="full").execute()
+
+                # Skip anything that's old by the time it reaches us. internalDate is when
+                # Gmail received the message (epoch ms); if it's older than the cutoff this
+                # is a stale thread resurfacing, not new mail.
+                try:
+                    if time.time() - int(msg.get("internalDate", "0")) / 1000 > _EMAIL_MAX_AGE_SECONDS:
+                        continue
+                except (ValueError, TypeError):
+                    pass
+
                 headers = {h["name"]: h["value"] for h in msg["payload"].get("headers", [])}
 
                 def _extract(payload):
@@ -476,6 +553,34 @@ async def inbox_watcher():
         await asyncio.sleep(EMAIL_POLL_INTERVAL)
 
 
+async def idle_consolidator():
+    """Sleep-time memory consolidation (Letta pattern): when Miles is idle — not running a
+    turn, nothing queued, not on a call — fold new episodes into long-term memory in the
+    background, so consolidation never blocks a response and never races a live turn."""
+    from agent.tools.memory import dream
+    await asyncio.sleep(90)
+    while True:
+        await asyncio.sleep(120)
+        if agent.is_running or not agent_queue.empty() or not _agent_gate.is_set():
+            continue
+        if len(store.unconsolidated_episodes(limit=2)) < 2:
+            continue
+        # Take the same lock the consumer holds during a turn, then re-check under it — so we
+        # never start a dream in the gap before a just-enqueued turn grabs the lock. If a turn
+        # is waiting, this acquire yields to it on the next loop.
+        if _turn_lock.locked():
+            continue
+        async with _turn_lock:
+            if agent.is_running or not agent_queue.empty() or not _agent_gate.is_set():
+                continue
+            try:
+                log.info("idle_consolidation_start")
+                summary = await dream()
+                log.info("idle_consolidation_done", summary=summary[:200])
+            except Exception as e:
+                log.warning("idle_consolidation_failed", err=str(e))
+
+
 def _keyring_selftest() -> None:
     """Verify the keyring actually unlocks. A wrong/missing KEYRING_PASSWORD makes
     every get_secret() return an error string that Miles can't tell from a real value
@@ -512,6 +617,14 @@ async def lifespan(app: FastAPI):
         SOUL_FILE.write_text(_SOUL_SEED)
         log.info("soul_created", path=str(SOUL_FILE))
 
+    # One-time fold of the old scattered state (agent_state.json, tasks.json, soul.md,
+    # journals) into miles.db — the single source of truth. No-ops after the first run.
+    try:
+        from agent.migrate import migrate
+        log.info("migration", detail=migrate())
+    except Exception as e:
+        log.warning("migration_failed", err=str(e))
+
     # Seed default playbooks — retrieved on demand, never in the system prompt.
     # Only seeds missing files, so Miles's own edits and new playbooks persist.
     PLAYBOOKS_DIR.mkdir(parents=True, exist_ok=True)
@@ -529,12 +642,12 @@ async def lifespan(app: FastAPI):
     scheduler._aps.add_job(
         lambda: _enqueue_heartbeat({"type": "heartbeat",
             "id": "dream-periodic",
-            "reason": "periodic dream",
+            "reason": "periodic housekeeping",
             "context": (
-                "Periodic dream + housekeeping.\n"
-                "1. dream() — consolidates new journal entries and updates soul.md's dream sections. "
-                "Read its output for anything that needs action.\n"
-                "2. Reconcile the ledger: list_tasks(), close what's done, add what the dream surfaced.\n"
+                "Periodic housekeeping. Your memory now consolidates itself automatically whenever "
+                "you're idle, so you don't need to dream by hand.\n"
+                "1. Reconcile the ledger: list_tasks(), close what's done, add anything new.\n"
+                "2. Update your focus (set_focus) so a restart picks up cleanly.\n"
                 "3. Tidy /data: read your data-hygiene playbook (list_sandbox_directory('playbooks')) and follow it."
             ),
             "fire_at": time.time(),
@@ -570,6 +683,7 @@ async def lifespan(app: FastAPI):
     scheduler.load_pending()
     asyncio.create_task(agent_consumer())
     asyncio.create_task(inbox_watcher())
+    asyncio.create_task(idle_consolidator())
 
     async def _boot_continuation():
         await asyncio.sleep(15)
@@ -589,15 +703,16 @@ async def lifespan(app: FastAPI):
             "id": "boot-continuation",
             "reason": "startup",
             "context": (
-                "You restarted — working memory carried over, so this is a nudge, not a reset.\n"
-                "1. list_tasks() is your work list — continue the most important in_progress or blocked item.\n"
+                "You restarted — your memory carried over (it's compiled at the top of this turn), so "
+                "this is a nudge, not a reset. What you were in the middle of and your open ledger are "
+                "already in front of you.\n"
+                "1. Continue the most important in_progress or blocked item — pick up from your focus/next action.\n"
                 "2. If something kept failing before the restart, search_memories() about it before retrying.\n"
                 "3. Check the inbox for anything new.\n"
                 "4. Any browser_task or run_subagent you dispatched before the restart is GONE (background "
                 "work doesn't survive a restart) — if you were waiting on one, re-dispatch it; don't wait for "
                 "a result that won't come.\n"
-                "5. Nothing pending? Find the highest-value open thread, add it to the ledger, and start it.\n"
-                "Read soul.md if you need to reground."
+                "5. Nothing pending? Find the highest-value open thread, add it to the ledger, and start it."
             ),
             "fire_at": now,
             "fire_at_iso": datetime.fromtimestamp(now, tz=timezone.utc).isoformat(),
@@ -608,13 +723,8 @@ async def lifespan(app: FastAPI):
     # letting every get_secret() silently return an error string (Miles losing all creds).
     _keyring_selftest()
     yield
-    # Best-effort durable save on graceful shutdown (SIGTERM). docker stop's grace
-    # period gives an in-flight turn a chance to finish and save via run()'s finally;
-    # this captures whatever state exists if it doesn't.
-    try:
-        agent._save_state()
-    except Exception as e:
-        log.warning("shutdown_save_failed", err=str(e))
+    # State is the DB now — every message is persisted the moment it's produced (see
+    # core.run / _tool_loop), so there's nothing to flush on shutdown.
     scheduler.shutdown()
 
 
@@ -693,12 +803,8 @@ async def voice_stream(websocket: WebSocket):
 
 @app.get("/tasks")
 async def get_tasks():
-    if not TASKS_FILE.exists():
-        return []
-    try:
-        return json.loads(TASKS_FILE.read_text())
-    except Exception:
-        return []
+    # `notes` alias kept so the existing frontend Tasks tab keeps rendering.
+    return [{**t, "notes": t.get("note", "")} for t in store.list_tasks(include_done=True)]
 
 
 @app.get("/skills")
@@ -752,7 +858,7 @@ async def get_status():
     return {
         "status": "ok",
         "model": agent.model,
-        "history_len": len(agent.history),
+        "history_len": store.message_count(),
         "graphiti": runtime.graphiti is not None,
         "llm_spend": spend_summary(),
     }

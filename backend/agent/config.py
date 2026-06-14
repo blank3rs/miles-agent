@@ -26,6 +26,7 @@ REPORTS_DIR     = DATA_DIR / "reports"
 SOUL_FILE       = DATA_DIR / "soul.md"
 TASKS_FILE      = DATA_DIR / "tasks.json"
 AGENT_STATE_FILE = DATA_DIR / "agent_state.json"
+MILES_DB        = DATA_DIR / "miles.db"   # single source of truth (see agent/store.py)
 
 KEYRING_SERVICE = "heso-ceo-miles"
 

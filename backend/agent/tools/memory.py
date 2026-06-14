@@ -13,8 +13,8 @@ from datetime import datetime, timedelta, timezone
 import structlog
 from openai import OpenAI
 
-from agent import runtime
-from agent.config import AZURE_API_KEY, AZURE_ENDPOINT, DREAMS_DIR, JOURNAL_DIR, MODEL, SOUL_FILE
+from agent import runtime, store
+from agent.config import AZURE_API_KEY, AZURE_ENDPOINT, DREAMS_DIR, MODEL
 
 log = structlog.get_logger()
 
@@ -32,8 +32,13 @@ _DREAM_LENSES = [
     ("narrative",     "Write an honest, first-person narrative of Miles's day. What mattered most? What is he thinking about going forward?"),
 ]
 
-# Sections of soul.md that dream() owns and rewrites
-_SOUL_SECTIONS = ("## What I'm learning", "## People I know", "## Things that matter right now")
+# Dream-owned memory blocks, by the markdown header the model emits ↔ the store block label.
+_SECTION_TO_BLOCK = {
+    "## What I'm learning": "learning",
+    "## People I know": "people",
+    "## Things that matter right now": "matters_now",
+}
+_SOUL_SECTIONS = tuple(_SECTION_TO_BLOCK.keys())
 
 _SOUL_PROMPT = """You maintain the dream-owned sections of Miles Kuncet's soul file — his persistent sense of self. This is long-term memory: treat it as APPEND-AND-REFINE, not a fresh rewrite. Rewriting from scratch each time silently erodes hard-won specifics ("context collapse") — don't do that.
 
@@ -62,28 +67,19 @@ def _client() -> OpenAI:
 
 
 async def journal_entry(event_type: str, content: str) -> str:
-    """Log an event to today's journal — the raw material for dreaming."""
+    """Log an event as an episode in the store — the raw material the dream consolidates."""
     try:
-        JOURNAL_DIR.mkdir(parents=True, exist_ok=True)
-        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        entry = {
-            "ts": datetime.now(timezone.utc).isoformat(),
-            "type": event_type,
-            "content": content,
-        }
-        with (JOURNAL_DIR / f"{today}.jsonl").open("a") as f:
-            f.write(json.dumps(entry) + "\n")
+        store.add_episode(event_type, content)
         return f"Logged [{event_type}]"
     except Exception as e:
         return f"[journal error] {e}"
 
 
-def _extract_sections(soul: str) -> str:
-    """Pull the current dream-owned sections out of soul.md for the update prompt."""
+def _current_sections() -> str:
+    """The dream-owned blocks as they stand now, formatted for the update prompt."""
     parts = []
-    for header in _SOUL_SECTIONS:
-        m = re.search(rf"^{re.escape(header)}\s*\n(.*?)(?=^## |\Z)", soul, re.S | re.M)
-        body = m.group(1).strip() if m else "(empty)"
+    for header, label in _SECTION_TO_BLOCK.items():
+        body = store.get_block(label).strip() or "(empty)"
         parts.append(f"{header}\n{body}")
     return "\n\n".join(parts)
 
@@ -107,26 +103,20 @@ def _parse_sections(text: str) -> dict[str, str]:
     return sections
 
 
-def _replace_section(soul: str, header: str, body: str) -> str:
-    pattern = re.compile(rf"^{re.escape(header)}\s*\n.*?(?=^## |\Z)", re.S | re.M)
-    block = f"{header}\n\n{body}\n\n"
-    if pattern.search(soul):
-        return pattern.sub(lambda _: block, soul, count=1)
-    return soul.rstrip() + "\n\n" + block
+async def _update_blocks(client: OpenAI, date_str: str, results: list[tuple[str, str]]) -> tuple[str, bool]:
+    """Refine the dream-owned memory blocks in the store from today's analyses (Letta
+    pattern: the sleep agent has write authority over memory; the waking agent only reads).
+    Append-and-refine, never a fresh rewrite, so hard-won specifics don't erode.
 
-
-async def _update_soul(client: OpenAI, date_str: str, results: list[tuple[str, str]]) -> str:
-    """Rewrite soul.md's dream sections from today's analyses. Returns a status line."""
-    if not SOUL_FILE.exists():
-        return "soul.md not found — skipped"
+    Returns (status, wrote) — wrote is True only if a block was actually set, so the caller
+    knows whether consolidation truly landed before retiring the episodes."""
     try:
-        soul = SOUL_FILE.read_text()
         analyses = "\n\n".join(
             f"### {name}\n{text}" for name, text in results if "[analysis failed" not in text
         )
-        prompt = _SOUL_PROMPT.format(
-            current=_extract_sections(soul), analyses=analyses, date=date_str
-        )
+        if not analyses.strip():
+            return "blocks unchanged — no analyses", False
+        prompt = _SOUL_PROMPT.format(current=_current_sections(), analyses=analyses, date=date_str)
         resp = await asyncio.to_thread(
             client.chat.completions.create,
             model=MODEL,
@@ -136,55 +126,34 @@ async def _update_soul(client: OpenAI, date_str: str, results: list[tuple[str, s
         )
         sections = _parse_sections(resp.choices[0].message.content or "")
         if not sections:
-            return "soul.md unchanged — could not parse model output"
+            return "blocks unchanged — could not parse model output", False
+        written = []
         for header, body in sections.items():
-            if body:
-                soul = _replace_section(soul, header, body)
-        SOUL_FILE.write_text(soul)
-        return f"soul.md updated ({', '.join(h.lstrip('# ') for h in sections)})"
+            label = _SECTION_TO_BLOCK.get(header)
+            if label and body:
+                store.set_block(label, body)
+                written.append(label)
+        return f"blocks updated ({', '.join(written) or 'none'})", bool(written)
     except Exception as e:
-        log.warning("soul_update_failed", err=str(e))
-        return f"soul.md update failed: {e}"
+        log.warning("block_update_failed", err=str(e))
+        return f"block update failed: {e}", False
 
 
 async def dream(date_str: str = "") -> str:
-    """Process new journal entries through parallel lens analyses, ingest into the
-    knowledge graph, and rewrite soul.md's dream sections."""
+    """Consolidate new episodes: parallel lens analyses → Graphiti index → refine the
+    dream-owned memory blocks → mark the episodes consolidated. Reads the store's
+    unconsolidated episodes, so it's incremental by construction and safe to call any
+    time — the idle consolidator calls it, and it's also a manual tool."""
+    episodes = store.unconsolidated_episodes(limit=300)
+    if len(episodes) < 2:
+        return f"(only {len(episodes)} new episode — skipping dream)"
+
     if not date_str:
-        # At 4 AM the day's work is "yesterday" — back off 6h so the cron
-        # dreams about the right date instead of a nearly-empty new day.
         date_str = (datetime.now(timezone.utc) - timedelta(hours=6)).strftime("%Y-%m-%d")
 
-    journal_file = JOURNAL_DIR / f"{date_str}.jsonl"
-    if not journal_file.exists():
-        return f"(no journal entries for {date_str} — nothing to dream about)"
-
-    entries = []
-    for line in journal_file.read_text().strip().splitlines():
-        try:
-            entries.append(json.loads(line))
-        except Exception:
-            pass
-
-    # Incremental cursor: skip entries already processed by a previous dream for this date
-    dream_file = DREAMS_DIR / f"{date_str}.json"
-    already_processed = 0
-    if dream_file.exists():
-        try:
-            already_processed = int(json.loads(dream_file.read_text()).get("journal_entries", 0))
-        except Exception:
-            already_processed = 0
-    new_entries = entries[already_processed:]
-
-    if not new_entries:
-        return f"(all {len(entries)} journal entries for {date_str} already dreamed — nothing new)"
-    if len(entries) < 2:
-        return f"(only {len(entries)} journal entry for {date_str} — skipping dream)"
-
-    journal_text = "\n\n".join(
-        f"[{e['ts']} | {e['type']}]\n{e['content']}" for e in new_entries
+    episode_text = "\n\n".join(
+        f"[{e['created_at']} | {e['kind']}]\n{e['content']}" for e in episodes
     )
-
     client = _client()
 
     async def _analyze(lens_name: str, lens_prompt: str) -> tuple[str, str]:
@@ -196,12 +165,12 @@ async def dream(date_str: str = "") -> str:
                     {
                         "role": "system",
                         "content": (
-                            f"You are Miles Kuncet's reflective mind. Analyze these journal entries "
+                            f"You are Miles Kuncet's reflective mind. Analyze these recent events "
                             f"through exactly this lens: {lens_prompt}\n"
                             f"Be specific, concrete, first person. Date: {date_str}"
                         ),
                     },
-                    {"role": "user", "content": f"Journal entries for {date_str}:\n\n{journal_text}"},
+                    {"role": "user", "content": f"Recent events:\n\n{episode_text}"},
                 ],
                 max_tokens=600,
                 temperature=0.3,
@@ -214,27 +183,27 @@ async def dream(date_str: str = "") -> str:
         await asyncio.gather(*[_analyze(name, prompt) for name, prompt in _DREAM_LENSES])
     )
 
-    # Ingest into Graphiti. Per-episode try/except so one failed extraction can't
-    # abort the whole batch, and counts are logged — a silently-empty graph is how
-    # the extraction bug went unnoticed for a full day.
+    # Ingest the analyses into Graphiti — the recall INDEX, not the source of truth. Per-
+    # episode try/except so one failed extraction can't abort the batch; counts are logged.
     communities_built = False
     ingested = 0
     ingest_failed = 0
     if runtime.graphiti:
         from graphiti_core.nodes import EpisodeType
         try:
-            ref_time = datetime.fromisoformat(new_entries[-1]["ts"])
+            ref_time = datetime.fromisoformat(episodes[-1]["created_at"])
         except Exception:
-            ref_time = datetime.fromisoformat(f"{date_str}T04:00:00+00:00")
+            ref_time = datetime.now(timezone.utc)
+        last_id = episodes[-1]["id"]
         for lens_name, analysis in results:
             if "[analysis failed" in analysis:
                 continue
             try:
                 await runtime.graphiti.add_episode(
-                    name=f"dream_{date_str}_{lens_name}_{already_processed}",
+                    name=f"dream_{date_str}_{lens_name}_{last_id}",
                     episode_body=analysis,
                     source=EpisodeType.text,
-                    source_description=f"nightly dream — {lens_name} — {date_str}",
+                    source_description=f"dream — {lens_name} — {date_str}",
                     reference_time=ref_time,
                     update_communities=True,
                 )
@@ -248,23 +217,32 @@ async def dream(date_str: str = "") -> str:
                 communities_built = True
             except Exception as e:
                 log.warning("graphiti_communities_failed", err=str(e))
-        log.info("graphiti_ingest", date=date_str, ingested=ingested, failed=ingest_failed)
+        log.info("graphiti_ingest", ingested=ingested, failed=ingest_failed)
 
-    soul_status = await _update_soul(client, date_str, results)
+    block_status, blocks_written = await _update_blocks(client, date_str, results)
 
-    DREAMS_DIR.mkdir(parents=True, exist_ok=True)
-    dream_file.write_text(
-        json.dumps(
-            {
-                "date": date_str,
-                "journal_entries": len(entries),   # cumulative — the incremental cursor
-                "analyses": {name: text for name, text in results},
-                "soul_status": soul_status,
-                "dreamed_at": datetime.now(timezone.utc).isoformat(),
-            },
-            indent=2,
-        )
-    )
+    # Only retire the episodes if consolidation actually LANDED somewhere — a block write
+    # or a graph ingest. If both failed (LLM/parse error AND Graphiti down or every lens
+    # errored), leave them unconsolidated so the next dream retries instead of silently
+    # dropping the day's memory.
+    if blocks_written or ingested > 0:
+        store.mark_consolidated([e["id"] for e in episodes])
+    else:
+        log.warning("dream_landed_nowhere", episodes=len(episodes),
+                    note="left unconsolidated for retry — neither blocks nor graph took the update")
+
+    # Diagnostic dream log — a human-readable artifact, not authoritative state.
+    try:
+        DREAMS_DIR.mkdir(parents=True, exist_ok=True)
+        (DREAMS_DIR / f"{date_str}.json").write_text(json.dumps({
+            "date": date_str,
+            "episodes": len(episodes),
+            "analyses": {name: text for name, text in results},
+            "block_status": block_status,
+            "dreamed_at": datetime.now(timezone.utc).isoformat(),
+        }, indent=2))
+    except Exception as e:
+        log.warning("dream_log_failed", err=str(e))
 
     narrative = next((t for n, t in results if n == "narrative"), "")
     if not runtime.graphiti:
@@ -278,12 +256,11 @@ async def dream(date_str: str = "") -> str:
     else:
         graph_status = f"nothing stored ({ingest_failed} extraction failures)" if ingest_failed else "no new memories"
     lines = [
-        f"Dream complete for {date_str} — {len(new_entries)} new journal entries processed"
-        f" ({len(entries)} total for the day).",
+        f"Dream complete — {len(episodes)} episodes consolidated.",
         f"Graphiti: {graph_status}",
-        f"Soul: {soul_status}",
+        f"Blocks: {block_status}",
         "",
-        "## Today's narrative",
+        "## Narrative",
         narrative,
         "",
         "## Other lenses (truncated)",
@@ -291,7 +268,6 @@ async def dream(date_str: str = "") -> str:
     for name, text in results:
         if name != "narrative":
             lines.append(f"\n**{name}**: {text[:250]}{'...' if len(text) > 250 else ''}")
-    lines.append(f"\nFull dream saved to /data/dreams/{date_str}.json")
     return "\n".join(lines)
 
 
@@ -391,7 +367,7 @@ DEFINITIONS = [
         "type": "function",
         "function": {
             "name": "dream",
-            "description": "Process new journal entries into memories. Runs parallel analyses across 11 lenses (people, decisions, patterns, learnings, etc.), stores results in the knowledge graph, and rewrites the dream-owned sections of soul.md itself. Incremental — already-dreamed entries are skipped, so it's safe to call any time. The dream cron calls it every 4 hours.",
+            "description": "Consolidate new episodes into long-term memory. Runs parallel analyses across 11 lenses (people, decisions, patterns, learnings, etc.), indexes the results in the knowledge graph, and refines your dream-owned memory blocks (what you're learning / people you know / what matters now). Incremental — only un-consolidated episodes are processed — so it's safe to call any time. It also runs automatically whenever you're idle, so you rarely need to call it by hand.",
             "parameters": {
                 "type": "object",
                 "properties": {

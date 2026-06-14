@@ -19,10 +19,10 @@ import json
 
 import structlog
 
-from agent import runtime
-from agent.config import AZURE_API_KEY, AZURE_ENDPOINT, CALLS_DIR, MODEL, SOUL_FILE
+from agent import runtime, store
+from agent.config import AZURE_API_KEY, AZURE_ENDPOINT, CALLS_DIR, MODEL
 from agent.voice.gemini_live import build_client, build_config, connect
-from agent.voice.persona import build_voice_instruction
+from agent.voice.persona import build_voice_instruction, is_trusted_caller
 from agent.voice.transcode import gemini_to_twilio, twilio_to_gemini
 
 log = structlog.get_logger()
@@ -40,6 +40,20 @@ def _load_briefing(call_id: str) -> str:
     except Exception as e:
         log.warning("briefing_load_failed", call_id=call_id, err=str(e))
     return ""
+
+
+def _compose_identity() -> str:
+    """Voice-Miles's identity, read from the same memory blocks the text loop compiles —
+    his durable self plus what his dreams have learned. One brain, two front-ends."""
+    blocks = store.all_blocks()
+    parts: list[str] = []
+    if blocks.get("identity", "").strip():
+        parts.append(blocks["identity"].strip())
+    for label in store.DREAM_BLOCKS:
+        body = blocks.get(label, "").strip()
+        if body:
+            parts.append(f"## {label.replace('_', ' ').title()}\n{body}")
+    return "\n\n".join(parts)
 
 
 def _render_transcript(segments: list[dict]) -> str:
@@ -134,7 +148,11 @@ async def run_call_bridge(twilio_ws) -> None:
     caller = ""
     up_state = None
     down_state = None
+    paused = False
     segments: list[dict] = []
+    send_lock = asyncio.Lock()  # serialize all sends on the one Live session
+    tool_tasks: list[asyncio.Task] = []  # background non-blocking voice-tool runs
+    tool_gen = 0  # bumps on barge-in; a tool whose answer is from a stale generation is dropped
 
     try:
         client = build_client()
@@ -178,24 +196,75 @@ async def run_call_bridge(twilio_ws) -> None:
         await twilio_ws.close()
         return
 
-    briefing = _load_briefing(call_id)
+    # Identity comes from the SAME store the text loop uses — voice-Miles is the same
+    # Miles, not a separate persona reading a stale file.
     try:
-        soul = SOUL_FILE.read_text() if SOUL_FILE.exists() else ""
+        soul = _compose_identity()
     except Exception:
         soul = ""
+
+    # Inbound call from Akshay with no prepared briefing → hand voice-Miles a LIVE snapshot
+    # of what text-Miles is doing right now, read fresh from the store. Trusted caller only;
+    # we never narrate internal work state to someone we don't recognize.
+    briefing = _load_briefing(call_id)
+    inbound = not to
+    if not briefing and inbound and is_trusted_caller(caller):
+        try:
+            snap = store.live_snapshot()
+            if snap:
+                briefing = ("This is Akshay calling. Here's exactly what you're in the middle of "
+                            "right now, so talk about it like you know your own day:\n\n" + snap)
+        except Exception as e:
+            log.warning("voice_snapshot_failed", err=str(e))
+
+    # Pause the text loop for the length of an inbound call so it isn't mutating state
+    # (sending mail, editing files) under the conversation. Outbound calls Miles places
+    # himself don't pause — he dispatched them and keeps working.
+    if inbound and runtime.pause_agent:
+        runtime.pause_agent("inbound call")
+        paused = True
+
     config = build_config(build_voice_instruction(briefing, soul=soul, caller=caller))
     log.info("voice_call_start", stream_sid=stream_sid, call_id=call_id,
-             briefed=bool(briefing), caller=caller, soul=bool(soul))
+             briefed=bool(briefing), caller=caller, inbound=inbound, soul=bool(soul))
 
     try:
         async with connect(client, config) as session:
+            from agent.voice.voice_tools import handle_voice_tool
+
+            async def _send_audio(pcm: bytes) -> None:
+                async with send_lock:
+                    await session.send_realtime_input(audio=types.Blob(data=pcm, mime_type="audio/pcm;rate=16000"))
+
+            async def _run_voice_tool(fc, spawn_gen: int) -> None:
+                """Run a voice tool OFF the receive loop and feed the result back when ready.
+                The tools are NON_BLOCKING, so Miles kept talking; WHEN_IDLE folds the answer
+                in at his next pause and he continues right where he was — no dead air."""
+                args = dict(fc.args or {})
+                log.info("voice_tool_call", tool=fc.name, args=args)
+                result = await handle_voice_tool(fc.name, args)
+                # If the caller barged in (or hung up) while this ran, the question is stale —
+                # don't inject an answer to something they've moved past.
+                if spawn_gen != tool_gen:
+                    log.info("voice_tool_dropped_stale", tool=fc.name)
+                    return
+                try:
+                    async with send_lock:
+                        await session.send_tool_response(function_responses=[types.FunctionResponse(
+                            id=fc.id, name=fc.name, response=result,
+                            scheduling=types.FunctionResponseScheduling.WHEN_IDLE,
+                        )])
+                except Exception as e:
+                    log.warning("voice_tool_response_failed", tool=fc.name, err=str(e))
+
             try:
-                await session.send_client_content(
-                    turns=types.Content(role="user", parts=[types.Part(
-                        text="The call just connected. Open it — greet them in one short, natural line as Miles."
-                    )]),
-                    turn_complete=True,
-                )
+                async with send_lock:
+                    await session.send_client_content(
+                        turns=types.Content(role="user", parts=[types.Part(
+                            text="The call just connected. Open it — greet them in one short, natural line as Miles."
+                        )]),
+                        turn_complete=True,
+                    )
             except Exception:
                 pass
 
@@ -203,19 +272,19 @@ async def run_call_bridge(twilio_ws) -> None:
                 nonlocal up_state
                 for chunk in pending_media:
                     pcm, up_state = twilio_to_gemini(chunk, up_state)
-                    await session.send_realtime_input(audio=types.Blob(data=pcm, mime_type="audio/pcm;rate=16000"))
+                    await _send_audio(pcm)
                 pending_media.clear()
                 while True:
                     msg = json.loads(await twilio_ws.receive_text())
                     ev = msg.get("event")
                     if ev == "media":
                         pcm, up_state = twilio_to_gemini(base64.b64decode(msg["media"]["payload"]), up_state)
-                        await session.send_realtime_input(audio=types.Blob(data=pcm, mime_type="audio/pcm;rate=16000"))
+                        await _send_audio(pcm)
                     elif ev == "stop":
                         return
 
             async def gemini_to_twilio_pump():
-                nonlocal down_state
+                nonlocal down_state, tool_gen
                 # session.receive() ends its generator after each turn completes —
                 # re-enter it for the life of the call so the conversation continues
                 # past the first turn (otherwise the call drops after the greeting).
@@ -228,14 +297,10 @@ async def run_call_bridge(twilio_ws) -> None:
                         # with real context mid-call instead of guessing.
                         tcall = getattr(response, "tool_call", None)
                         if tcall and tcall.function_calls:
-                            from agent.voice.voice_tools import handle_voice_tool
-                            fresponses = []
+                            # Don't block the receive loop on the tool — spawn it and keep
+                            # streaming audio. The result is fed back when it's ready.
                             for fc in tcall.function_calls:
-                                args = dict(fc.args or {})
-                                log.info("voice_tool_call", tool=fc.name, args=args)
-                                result = await handle_voice_tool(fc.name, args)
-                                fresponses.append(types.FunctionResponse(id=fc.id, name=fc.name, response=result))
-                            await session.send_tool_response(function_responses=fresponses)
+                                tool_tasks.append(asyncio.create_task(_run_voice_tool(fc, tool_gen)))
                             continue
                         sc = getattr(response, "server_content", None)
                         if not sc:
@@ -248,6 +313,7 @@ async def run_call_bridge(twilio_ws) -> None:
                             segments.append({"speaker": "miles", "text": ot.text})
                         if getattr(sc, "interrupted", False):
                             down_state = None
+                            tool_gen += 1  # any in-flight tool answer is now stale
                             await twilio_ws.send_text(json.dumps({"event": "clear", "streamSid": stream_sid}))
                             continue
                         turn = getattr(sc, "model_turn", None)
@@ -265,14 +331,37 @@ async def run_call_bridge(twilio_ws) -> None:
                     if not received_any:
                         return  # session closed — stop re-entering receive()
 
+            async def _lease_keepalive():
+                # A real call can outlast the pause lease (30 min). Re-extend it while the
+                # call is live so the TTL only ever fires as a true deadlock backstop, never
+                # under an active call (which would let the text loop mutate state mid-call).
+                while True:
+                    await asyncio.sleep(600)
+                    if paused and runtime.pause_agent:
+                        runtime.pause_agent("call keepalive")
+
             up = asyncio.create_task(twilio_to_gemini_pump())
             down = asyncio.create_task(gemini_to_twilio_pump())
-            _, pend = await asyncio.wait({up, down}, return_when=asyncio.FIRST_COMPLETED)
-            for t in pend:
+            keepalive = asyncio.create_task(_lease_keepalive()) if paused else None
+
+            done, pend = await asyncio.wait({up, down}, return_when=asyncio.FIRST_COMPLETED)
+            for t in done:
+                if t.exception():  # a pump that ended by raising — surface it, don't swallow
+                    log.warning("voice_pump_error", err=str(t.exception()))
+            # Cancel every still-running task AND await them before leaving the `async with`
+            # block (which closes the Live session) — otherwise a tool task suspended in
+            # send_tool_response could resume and send on a dead session.
+            stragglers = [*pend, *tool_tasks] + ([keepalive] if keepalive else [])
+            for t in stragglers:
                 t.cancel()
+            await asyncio.gather(*stragglers, return_exceptions=True)
     except Exception as e:
         log.warning("voice_bridge_error", err=str(e))
     finally:
+        # Always release the text loop, even if the call blew up — the lease TTL is only a
+        # backstop, not the normal path.
+        if paused and runtime.resume_agent:
+            runtime.resume_agent()
         log.info("voice_call_end", stream_sid=stream_sid, call_id=call_id, segments=len(segments))
         # Summarize + deliver off the event loop so a slow LLM call can't block teardown.
         await asyncio.to_thread(_deliver_outcome, call_id, to, purpose, segments)

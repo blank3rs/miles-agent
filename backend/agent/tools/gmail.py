@@ -186,9 +186,12 @@ async def send_email(to: str, subject: str, body: str, attachments: list | None 
     from email.mime.text import MIMEText
     from email import encoders as email_encoders
 
+    from agent import audit
     recipients = _norm_recipients(to)
     capped = _recipient_over_cap(recipients)
     if capped:
+        audit.record("send_email", target=to, decision="blocked", reason="anti-spam cap",
+                     params={"subject": subject})
         return (f"[blocked — anti-spam] You've already emailed {capped} {_MAX_PER_RECIPIENT_24H} times in the "
                 "last 24h. Don't keep emailing the same person — wait for a reply, or if it's genuinely urgent "
                 "loop in Akshay. This guard prevents accidental spamming.")
@@ -252,6 +255,7 @@ async def send_email(to: str, subject: str, body: str, attachments: list | None 
     try:
         await asyncio.to_thread(_send)
         _record_send(recipients)  # count only successful sends toward the anti-spam cap
+        audit.record("send_email", target=to, decision="allowed", reason=subject[:80])
         result = f"Sent from {EMAIL_ADDRESS} to {to} — {subject}"
         if attached:
             result += f"\nAttachments: {', '.join(attached)}"

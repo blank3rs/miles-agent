@@ -40,7 +40,10 @@ _openai_client = OpenAI(api_key=_openai_key, max_retries=0) if _openai_key else 
 # the main model if no OpenAI key is configured.
 UTILITY_MODEL = os.getenv("UTILITY_MODEL", "gpt-4o-mini") if _openai_client else MODEL
 
-_MAX_CONCURRENCY = int(os.getenv("LLM_MAX_CONCURRENCY", "3"))
+# Higher now that 429s are ridden out with backoff instead of killing a turn — so many
+# parallel sub-agents genuinely run at once instead of single-filing through a tight gate.
+# It's still a safety valve against a 429 storm; tune via LLM_MAX_CONCURRENCY.
+_MAX_CONCURRENCY = int(os.getenv("LLM_MAX_CONCURRENCY", "6"))
 _MAX_ATTEMPTS    = int(os.getenv("LLM_MAX_ATTEMPTS", "6"))
 _RETRYABLE_STATUS = {429, 500, 502, 503, 504}
 

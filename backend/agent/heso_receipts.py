@@ -119,14 +119,20 @@ def _mint_blocking(action: str, target: str, decision: str, reason: str, params_
             },
         )
         outcome = heso.process(act)
+        rcpt = outcome.receipt if isinstance(outcome.receipt, dict) else {}
+        # Only a finalized (signed) receipt carries content.action_hash and is pushable. A floored
+        # verb (account_change/delete/payment/data_export) comes back SUSPENDED with no finalized
+        # receipt — HESO is saying "this needs a human co-sign", there is nothing to push — so
+        # record the outcome instead of erroring on a half-built receipt.
         pushed = False
-        try:
-            heso.cloud.push_receipt(outcome.receipt or {})
-            pushed = True
-        except Exception as e:
-            # Ledger unreachable — the receipt is still signed + chained locally; the outbox
-            # retries on the next push. Not an error for Miles.
-            log.info("heso_push_deferred", action=action, err=str(e))
+        if rcpt.get("content", {}).get("action_hash"):
+            try:
+                heso.cloud.push_receipt(rcpt)
+                pushed = True
+            except Exception as e:
+                # Ledger unreachable — the receipt is still signed + chained locally; the outbox
+                # retries on the next push. Not an error for Miles.
+                log.info("heso_push_deferred", action=action, err=str(e))
         log.info("heso_receipt", action=action, kind=str(getattr(outcome, "kind", "")), pushed=pushed)
     except Exception as e:
         log.warning("heso_mint_failed", action=action, err=str(e))

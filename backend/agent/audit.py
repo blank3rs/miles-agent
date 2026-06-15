@@ -10,6 +10,7 @@ own until then.
 """
 from __future__ import annotations
 
+import contextvars
 import hashlib
 import json
 import re
@@ -18,9 +19,24 @@ from typing import Any
 
 import structlog
 
-from agent import store
+from agent import heso_receipts, store
 
 log = structlog.get_logger()
+
+# Per-asyncio-task capture of the receipts minted during one tool call. asyncio.gather runs
+# each tool in its own copied context, so this box is private to the call that set it — every
+# receipt attributes to the exact call that minted it, with no high-water racing between
+# concurrent tools (e.g. two send_email in the same round).
+_capture: contextvars.ContextVar[list[dict[str, Any]] | None] = contextvars.ContextVar(
+    "receipt_capture", default=None
+)
+
+
+def capture_receipts() -> list[dict[str, Any]]:
+    """Begin capturing receipts minted on the current task; return the list they land in."""
+    box: list[dict[str, Any]] = []
+    _capture.set(box)
+    return box
 
 
 def _params_digest(params: dict[str, Any] | None) -> str:
@@ -49,7 +65,15 @@ def record(
                                    decision=decision, reason=reason)
     except Exception as e:
         log.warning("receipt_write_failed", action=action, err=str(e))
+    box = _capture.get()
+    if box is not None and digest:
+        box.append({"action": action, "target": target, "decision": decision,
+                    "reason": reason, "receipt_id": digest})
     log.info("action_receipt", action=action, target=target, decision=decision, reason=reason)
+    # Also mint a real, offline-verifiable HESO ActionReceipt (best-effort, off the hot loop;
+    # no-op unless HESO_API_KEY is configured). The local chain above stands on its own.
+    heso_receipts.mint(action, target=target, decision=decision, reason=reason,
+                       params_digest=_params_digest(params))
     return digest
 
 

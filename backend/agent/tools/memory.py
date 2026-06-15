@@ -331,11 +331,32 @@ async def retrieve_episodes(last_n: int = 20) -> str:
         return f"[retrieve_episodes failed] {e}"
 
 
+async def search_facts(query: str, limit: int = 8) -> str:
+    """Search Miles's bi-temporal facts — the deduped, currently-valid knowledge the scribe
+    reconciles after each turn (people, roles, preferences, commitments). Separate from the
+    knowledge graph: it lives in miles.db, works without Graphiti, and the most relevant facts
+    are already auto-injected each turn — call this to dig for something not already in front of you."""
+    try:
+        from agent import facts
+
+        rows = await asyncio.to_thread(facts.recall_facts, query, limit)
+        if not rows:
+            return f"(no facts yet for: {query!r})"
+        lines = []
+        for r in rows:
+            date = str(r.get("recorded_at") or "")[:10] or "?"
+            lines.append(f"[fact|{date}] {r['statement']}")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"[fact search failed] {e}"
+
+
 HANDLERS = {
     "journal_entry":     journal_entry,
     "dream":             dream,
     "search_memories":   search_memories,
     "retrieve_episodes": retrieve_episodes,
+    "search_facts":      search_facts,
 }
 
 DEFINITIONS = [
@@ -402,6 +423,21 @@ DEFINITIONS = [
                     "last_n": {"type": "integer", "default": 20, "description": "How many recent episodes to retrieve"},
                 },
                 "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_facts",
+            "description": "Search your bi-temporal facts — the deduped, currently-valid knowledge the scribe reconciles after each turn (people and their roles, preferences, commitments, decisions that stand). Lives in your local store, works even when the knowledge graph is down, and supersession is non-destructive (you only see what's still true). The most relevant facts are auto-injected into every turn, so reach for this to dig up something specific that isn't already in front of you.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "What to look up — a person, topic, or attribute"},
+                    "limit": {"type": "integer", "default": 8, "description": "Max facts to return"},
+                },
+                "required": ["query"],
             },
         },
     },

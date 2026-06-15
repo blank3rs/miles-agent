@@ -9,9 +9,9 @@ from typing import Callable
 
 import structlog
 
-from agent import scribe, store
+from agent import audit, policy, safety, scribe, store
 from agent.config import AKSHAY_EMAIL, LOGS_DIR, ORCHESTRATOR_MODEL, WORKER_MODEL
-from agent.llm import UTILITY_MODEL, llm_create
+from agent.llm import UTILITY_MODEL, BudgetExceeded, llm_create
 from agent.persona import build_system_prompt
 from agent.tools import TOOL_DEFINITIONS, TOOL_HANDLERS
 
@@ -38,6 +38,104 @@ WRAPUP_NUDGE = (
     "if work remains, and reply with a brief status. Don't start anything new."
 )
 
+# ── Per-turn tool promotion (D2) ─────────────────────────────────────────────
+# A small safe core is ALWAYS promoted so the brain is never stranded: it can always
+# inspect/advance its work, listen, schedule itself, and reach Akshay. Everything else
+# is promoted by keyword/intent over the user message + open-work signals.
+_CORE_TOOLS = frozenset({
+    "list_tasks", "update_task", "set_heartbeat",
+    "search_memories", "send_email", "read_emails",
+})
+
+# External/irreversible ACTION tools whose re-fire on a confidence-escalation re-run would be a
+# real duplicate side effect (a second email, a second calendar event). The escalation dedup guard
+# in _exec_tool consults store.action_already_fired for exactly these — and ONLY when escalated, so
+# a normal turn that legitimately repeats an action is untouched (F4).
+_ESCALATION_DEDUP_TOOLS = frozenset({
+    "send_email", "create_calendar_event", "respond_to_calendar_event", "make_call",
+})
+
+# intent group → (trigger keywords, tool names). Keywords are matched as substrings against
+# the lowercased user message + working-state signals. A group fires wholesale (cheap at 52
+# tools; no embeddings). Groups overlap on purpose — a turn can pull several. New tools land
+# in a group here so promotion stays in lockstep with the registry (validated at startup).
+_TOOL_GROUPS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
+    "email": (
+        ("email", "inbox", "reply", "respond", "message", "mail", "send", "draft", "forward"),
+        ("send_email", "read_emails"),
+    ),
+    "calendar": (
+        ("calendar", "meeting", "schedule", "invite", "event", "availability", "free slot",
+         "book", "rsvp", "appointment", "call time", "reschedule"),
+        ("list_calendar_events", "create_calendar_event", "respond_to_calendar_event",
+         "find_free_slots"),
+    ),
+    "research": (
+        ("search", "research", "look up", "find out", "google", "web", "scrape", "url",
+         "website", "article", "news", "pdf", "read about", "browse"),
+        ("search_web", "exa_search", "scrape_url", "read_pdf", "web_cli"),
+    ),
+    "browser": (
+        ("browser", "log in", "login", "sign in", "click", "fill", "form", "captcha",
+         "screenshot", "page", "portal", "dashboard", "navigate", "automate the site"),
+        ("browser_task", "reset_browser_profile", "take_screenshot", "analyze_screenshot",
+         "solve_captcha", "read_sms"),
+    ),
+    "files": (
+        ("file", "directory", "folder", "read the", "write", "edit", "document", "report",
+         "save to", "sandbox", "heso file"),
+        ("read_heso_file", "read_file", "write_sandbox_file", "edit_file",
+         "list_heso_directory", "list_sandbox_directory"),
+    ),
+    "code": (
+        ("code", "script", "run python", "shell", "command", "install", "package",
+         "compute", "execute", "terminal"),
+        ("run_python", "run_shell", "install_package", "exec_sandboxed"),
+    ),
+    "secrets": (
+        ("secret", "credential", "password", "api key", "token", "login detail"),
+        ("store_secret", "get_secret", "list_secret_keys", "delete_secret"),
+    ),
+    "skills": (
+        ("skill", "capability", "teach yourself", "build a tool", "github skill"),
+        ("create_skill", "run_skill", "list_skills", "download_github_skill"),
+    ),
+    "memory": (
+        ("remember", "recall", "memory", "journal", "note to self", "what happened",
+         "history", "episode", "log it", "reflect", "dream", "fact", "know about", "who is"),
+        ("journal_entry", "dream", "retrieve_episodes", "search_facts"),
+    ),
+    "tasks": (
+        ("task", "todo", "to-do", "ledger", "focus", "track", "follow up", "follow-up",
+         "remind me", "next step", "plan"),
+        ("add_task", "set_focus", "check_tasks"),
+    ),
+    "contacts": (
+        ("contact", "phone number", "find someone", "lead", "prospect", "signalhire",
+         "person at", "reach out to"),
+        ("signalhire_credits", "signalhire_find_contact"),
+    ),
+    "voice": (
+        ("call", "phone", "dial", "ring", "voice", "speak to", "talk to them"),
+        ("make_call",),
+    ),
+    "heartbeats": (
+        ("heartbeat", "wake me", "check back", "later", "schedule myself", "recurring",
+         "cron", "in an hour", "tomorrow", "ping me"),
+        ("cancel_heartbeat", "list_heartbeats"),
+    ),
+    "vision": (
+        ("image", "screenshot", "video", "look at this", "analyze the picture", "photo",
+         "see the", "visual"),
+        ("take_screenshot", "analyze_image", "analyze_screenshot", "analyze_video"),
+    ),
+    "subagent": (
+        ("subagent", "delegate", "parallel", "fan out", "background task", "spawn",
+         "run in parallel", "kick off"),
+        ("run_subagent",),
+    ),
+}
+
 # Cost control: the premium orchestrator (Opus) runs only the turns that warrant it; the rest
 # run on the cheap worker. A tiny utility-model triage decides the ambiguous (external) cases.
 _IMPORTANCE_PROMPT = (
@@ -47,6 +145,32 @@ _IMPORTANCE_PROMPT = (
     "deal moving; or anything high-stakes. Answer 'routine' for: a bounce or auto-reply, a "
     "newsletter or notification, cold-outreach legwork, scheduling, research, or admin. "
     "Reply with exactly one word: important or routine."
+)
+
+# ── Reliability gates (2 + 3) — both default OFF behind env flags ─────────────────
+# Confidence escalation: when the cheap worker lands a final text answer to an external,
+# important-ish trigger, a utility judge scores it and, if low-confidence, re-runs the loop
+# ONCE on the orchestrator. Dry planning-consensus: for high-stakes ACTION turns, sample only
+# the first model response K times WITHOUT executing any tool, vote the plan, and on
+# disagreement inject a re-ground note before the loop executes exactly once.
+ENABLE_CONFIDENCE_ESCALATION = os.getenv("ENABLE_CONFIDENCE_ESCALATION", "0") == "1"
+ENABLE_DRY_CONSENSUS         = os.getenv("ENABLE_DRY_CONSENSUS", "0") == "1"
+_DRY_CONSENSUS_K             = int(os.getenv("DRY_CONSENSUS_K", "3"))
+
+_CONFIDENCE_PROMPT = (
+    "You judge whether an autonomous CMO agent's reply to the request below is confidently "
+    "complete and correct, or whether it looks uncertain, evasive, half-finished, or likely to be "
+    "wrong. Answer 'confident' if the reply clearly and fully addresses the request. Answer "
+    "'unsure' if it hedges, says it couldn't do something, leaves the task obviously incomplete, or "
+    "reads like a guess. Reply with exactly one word: confident or unsure."
+)
+
+# The re-ground note injected when the dry-consensus samples disagree on the first move — nudges
+# the model to re-check live state before committing to a single concrete action (never executes).
+_DRY_REGROUND_NOTE = (
+    "[system] Before acting, you considered several different first moves and they disagreed — "
+    "re-ground in the actual current state (read the inbox / re-check the page, file, or ledger) "
+    "and then choose the single safest concrete action."
 )
 
 
@@ -67,6 +191,20 @@ class Agent:
         # next few turns that actually has an in-flight task — not just the literal first turn,
         # which might be a trivial heartbeat that would waste the one-shot.
         self._boot_turns_left: int = 3
+        # The tool schemas promoted (sent as the volatile `tools=` field) for the current turn.
+        # None means "no promotion in effect" (the rejection gate is inert), so any path that
+        # reaches _tool_loop without run() having promoted still sees the full registry.
+        self._promoted_names: set[str] | None = None
+        # Reliability gates (set per turn in run()): _escalate_eligible marks the risky case
+        # 'we ran cheap on something external' so the final-text seam can judge+escalate once;
+        # _escalated is the hard single-escalation guard; _turn_important marks a high-stakes turn
+        # so dry planning-consensus only fires where it's worth the extra samples.
+        self._escalate_eligible: bool = False
+        self._escalated: bool = False
+        self._turn_important: bool = False
+        # Turn-start ISO timestamp (set per turn in run()): the since-cutoff the escalation dedup
+        # guard uses so a re-run can't replay an external action already fired this turn (F4).
+        self._turn_started_iso: str = ""
         store.init_db()
 
     def interrupt_for_akshay(self, email: dict) -> None:
@@ -119,20 +257,87 @@ class Agent:
         except Exception:
             return False
 
-    async def _pick_tier(self, trigger: str, user_message: str) -> str:
+    async def _is_safe_action(self, name: str, params: dict) -> tuple[bool, str]:
+        """Autonomy safety gate for a side-effecting ACTION tool. Delegates to the single
+        implementation in agent.safety so the hot loop and the call_tool bypass path can't drift.
+        (True, '') allows; (False, reason) holds. Fails OPEN — a utility outage never blocks."""
+        return await safety.is_safe_action(name, params)
+
+    async def _score_answer(self, user_message: str, answer: str) -> bool:
+        """Utility judge at the final-answer seam: True when the worker's reply is confidently
+        complete/correct, False when it reads low-confidence. Fails to True (don't escalate) on any
+        exception, so a judge hiccup never burns the premium tier."""
+        try:
+            resp = await llm_create(
+                model=UTILITY_MODEL,
+                messages=[
+                    {"role": "system", "content": _CONFIDENCE_PROMPT},
+                    {"role": "user", "content": (
+                        f"Request:\n{(user_message or '')[:1500]}\n\nReply:\n{(answer or '')[:2500]}"
+                    )},
+                ],
+                max_tokens=4,
+                temperature=0,
+            )
+            ans = (resp.choices[0].message.content or "").strip().lower()
+            return not ans.startswith("unsure")
+        except Exception:
+            return True
+
+    async def _pick_tier(self, trigger: str, user_message: str) -> tuple[str, bool]:
         """Route the turn to a model by importance. Opus only for the founder and genuinely
         high-stakes work; everything else (heartbeats, routine outreach, bounces, research,
-        dispatch results) runs on the cheap worker."""
+        dispatch results) runs on the cheap worker. Returns (tier, important) — `important` is the
+        judge's verdict on an external trigger, so the reliability gates know a turn was high-stakes
+        even when it was routed to the cheap worker."""
         t = (trigger or "").lower()
+        important = False
         if t == "user" or (AKSHAY_EMAIL and AKSHAY_EMAIL.lower() in t):
             tier = ORCHESTRATOR_MODEL                      # the founder is always top-tier
+            important = True
         elif t.startswith(("email:", "call:")):
-            tier = ORCHESTRATOR_MODEL if await self._is_important(user_message) else WORKER_MODEL
+            important = await self._is_important(user_message)
+            tier = ORCHESTRATOR_MODEL if important else WORKER_MODEL
         else:
             tier = WORKER_MODEL                            # heartbeats, dispatch results, etc.
-        log.info("turn_tier", tier=tier, trigger=trigger)
+        log.info("turn_tier", tier=tier, trigger=trigger, important=important)
         await self._emit("status", {"status": "tier", "message": tier})
-        return tier
+        return tier, important
+
+    # ── Per-turn tool promotion (D2) ────────────────────────────────────────────
+
+    @staticmethod
+    def _promote_tools(user_message: str, ctx: dict) -> tuple[list[dict], set[str]]:
+        """Choose the relevant subset of TOOL_DEFINITIONS to inline as full schemas this turn.
+
+        Keyword/intent gating over the user message + working-state/open-task signals (a
+        plain rule map at 52 tools — no embeddings). The always-resident one-line tool index
+        (D1) lives in the stable system prefix, so the brain still knows every tool exists; a
+        call to an un-promoted tool is bounced by the rejection gate so it can retry, never
+        failing the turn. The safe core is ALWAYS promoted so the brain is never stranded.
+
+        Returns (promoted_defs, promoted_names). promoted_defs is a FILTERED COPY of the
+        registry — never a mutation — so the parity asserts keep passing."""
+        resume = ctx.get("resume") or {}
+        signal = " ".join(
+            str(s) for s in (
+                user_message or "",
+                resume.get("current_goal") or "",
+                resume.get("next_action") or "",
+                (resume.get("active_task") or {}).get("title") or "",
+            )
+        ).lower()
+
+        names: set[str] = set(_CORE_TOOLS)
+        for keywords, tools in _TOOL_GROUPS.values():
+            if any(kw in signal for kw in keywords):
+                names.update(tools)
+
+        # Only promote names that are really in the registry (a typo'd group entry must not
+        # advertise a tool the dispatcher can't run). Keeps promotion in lockstep with parity.
+        names &= set(TOOL_HANDLERS)
+        promoted_defs = [d for d in TOOL_DEFINITIONS if d["function"]["name"] in names]
+        return promoted_defs, names
 
     # ── Public entry point ─────────────────────────────────────────────────────
 
@@ -141,12 +346,24 @@ class Agent:
         # A heads-up that arrived between turns is stale — the email it points to is
         # separately queued and handled as its own turn.
         self._akshay_interrupt = None
+        # Turn-start ISO timestamp: the since-cutoff for the escalation dedup guard (F4), so a
+        # re-run on the orchestrator can detect 'this exact external action already fired THIS turn'
+        # via store.action_already_fired and not replay the side effect.
+        self._turn_started_iso = datetime.now(timezone.utc).isoformat()
         try:
             await self._emit("start", {"trigger": trigger, "message": user_message})
 
             # Pick the model for THIS turn: premium (Opus) for the founder + high-stakes work,
             # cheap worker for everything routine. Keeps the always-on burn off the premium tier.
-            self.model = await self._pick_tier(trigger, user_message)
+            self.model, self._turn_important = await self._pick_tier(trigger, user_message)
+            # Reliability flags for this turn. Escalation is only eligible on the risky case: an
+            # external trigger (email:/call:) that we routed to the CHEAP worker — a wrong cheap
+            # answer there is exactly what we want to catch. _escalated guards single-shot.
+            self._escalated = False
+            self._escalate_eligible = (
+                (trigger or "").lower().startswith(("email:", "call:"))
+                and self.model == WORKER_MODEL
+            )
 
             # Persist the trigger immediately — a deploy/kill mid-turn can't lose the
             # request we're about to work on, because it's already in the log. The id marks
@@ -155,9 +372,12 @@ class Agent:
 
             ctx = store.compile_context()
 
-            system_prompt = build_system_prompt()
-            if ctx["system_context"]:
-                system_prompt += "\n\n" + ctx["system_context"]
+            # Split the system message into a day-stable STABLE block (persona + D1 tool index)
+            # and a VOLATILE block (everything recompiled this turn). Everything per-turn —
+            # system_context AND the post-restart resume note — goes in `volatile`; the stable
+            # prefix stays byte-identical within a day so the orchestrator's cache prefix hits.
+            persona_prefix = build_system_prompt()
+            volatile = ctx["system_context"] or ""
 
             # Within the first few turns after a restart, the first time Miles actually has an
             # in-flight task, tell him to verify before acting. Then stop (warned once); and if
@@ -166,12 +386,47 @@ class Agent:
                 self._boot_turns_left -= 1
                 active = ctx["resume"].get("active_task")
                 if active and active.get("status") in ("in_progress", "blocked"):
-                    system_prompt += self._resume_note(active)
+                    volatile += self._resume_note(active)
                     self._boot_turns_left = 0
 
-            messages = [{"role": "system", "content": system_prompt}] + ctx["history"]
+            messages = [
+                {"role": "system", "content": self._build_system_blocks(persona_prefix, volatile)}
+            ] + ctx["history"]
 
-            result = await self._tool_loop(messages)
+            # Choose the tool set for this turn by tier.
+            #  • Orchestrator (Opus, cache-eligible): send the FULL catalog in deterministic
+            #    registry order so the cached prefix (tools render BEFORE system in Anthropic
+            #    order) is byte-stable cross-turn — the prompt cache actually hits. _promoted_names
+            #    is the whole registry so the D2 rejection gate bounces nothing on Opus. The token
+            #    margin already reserves for the full catalog.
+            #  • Worker (DeepSeek, openai/ — no cache to bust): keep D2 keyword promotion to trim
+            #    per-turn input tokens, plus promote-on-demand recovery in _exec_tool (F6).
+            if self.model == ORCHESTRATOR_MODEL:
+                promoted_defs = list(TOOL_DEFINITIONS)
+                self._promoted_names = set(TOOL_HANDLERS)
+            else:
+                promoted_defs, self._promoted_names = self._promote_tools(user_message, ctx)
+
+            sect = self._section_tokens(
+                persona_prefix, ctx.get("section_chars", {}), ctx["history"], promoted_defs
+            )
+            log.info(
+                "turn_compiled",
+                tier=self.model,
+                trigger=trigger,
+                total_tokens=sum(sect.values()),
+                promoted_tools=len(self._promoted_names),
+                tool_catalog_full_tokens=len(json.dumps(TOOL_DEFINITIONS)) // CHARS_PER_TOKEN,
+                **sect,
+            )
+
+            try:
+                result = await self._tool_loop(messages, promoted_defs, user_message)
+            except BudgetExceeded as e:
+                # The monthly LLM-spend backstop tripped mid-turn. Land cleanly with a status the
+                # log can carry, rather than letting the cap surface as an unhandled crash.
+                result = f"[agent] Paused: {e}"
+                await self._emit("status", {"status": "budget_paused", "message": str(e)})
 
             store.append_message({"role": "assistant", "content": result})
 
@@ -181,12 +436,20 @@ class Agent:
             try:
                 turn_msgs = store.messages_since(turn_start_id)
                 asyncio.create_task(scribe.record_turn(trigger, turn_msgs))
+                # Also fold the older turns the verbatim window just dropped into the rolling
+                # summary (B2) — off the critical path, best-effort like record_turn.
+                excluded = store.turns_outside_budget()
+                if excluded:
+                    asyncio.create_task(scribe.update_history_summary(excluded))
             except Exception as e:
                 log.warning("scribe_dispatch_failed", err=str(e))
 
             return result
         finally:
             self.is_running = False
+            # Clear promotion so the rejection gate is inert outside a turn — any path that
+            # reaches _tool_loop without run() promoting first then sees the full registry.
+            self._promoted_names = None
 
     # ── Tool loop ──────────────────────────────────────────────────────────────
 
@@ -199,6 +462,50 @@ class Agent:
             s += len(str(tc.get("function", {}).get("arguments") or ""))
         return s
 
+    @staticmethod
+    def _build_system_blocks(persona_prefix: str, volatile: str) -> list[dict]:
+        """Render the system message as ordered OpenAI-shaped text blocks: the day-stable
+        persona prefix (persona + the D1 one-line tool index) FIRST, then the per-turn volatile
+        block (compiled system_context + any resume note) — never the other way round. No
+        cache_control here; llm.py adds it to block[0] only for the orchestrator tier. Anthropic
+        renders `tools` BEFORE `system`, so the cached prefix is (tools + this block[0]). It is
+        reused across the many tool ROUNDS of a turn always, and across TURNS on the orchestrator
+        tier — where the tool set is now the fixed full catalog (run()'s Opus branch), so the
+        prefix is byte-stable day to day. (The worker tier sends a per-turn promoted subset and
+        is openai/, so it isn't cache-eligible anyway.) The volatile block is dropped entirely when
+        empty (a cold boot still gets a valid one-block system message), and per-turn data must
+        never leak into block[0] or the cache silently never hits."""
+        blocks = [{"type": "text", "text": persona_prefix}]
+        if volatile:
+            blocks.append({"type": "text", "text": volatile})
+        return blocks
+
+    @classmethod
+    def _section_tokens(
+        cls, persona: str, system_context_chars: dict, history: list[dict], promoted_defs: list[dict]
+    ) -> dict:
+        """Per-section token estimate for one compiled turn (instrumentation only). Sums the
+        bare persona (which carries the always-resident one-line tool index), the memory-context
+        sections store.compile_context already built, the PROMOTED tool schemas actually sent in
+        tools= this turn (D2 — not the full catalog), and the history message sizes. Never any
+        tool params/results. tool_def_tokens is what the turn really pays; the full-catalog delta
+        is logged separately at the call site so the D2 saving is visible."""
+        sc = system_context_chars or {}
+        return {
+            "persona_tokens": len(persona) // CHARS_PER_TOKEN,
+            "identity_tokens": sc.get("identity", 0) // CHARS_PER_TOKEN,
+            "working_narrative_tokens": sc.get("working_narrative", 0) // CHARS_PER_TOKEN,
+            "working_state_tokens": sc.get("working_state", 0) // CHARS_PER_TOKEN,
+            "history_summary_tokens": sc.get("history_summary", 0) // CHARS_PER_TOKEN,
+            "ledger_tokens": sc.get("ledger", 0) // CHARS_PER_TOKEN,
+            "dream_tokens": sc.get("dream_blocks", 0) // CHARS_PER_TOKEN,
+            "facts_tokens": sc.get("facts", 0) // CHARS_PER_TOKEN,
+            "tool_def_tokens": len(json.dumps(promoted_defs)) // CHARS_PER_TOKEN,
+            "history_tokens": sum(cls._msg_size(m) for m in history) // CHARS_PER_TOKEN,
+            "pre_reasoned_tokens": sc.get("pre_reasoned", 0) // CHARS_PER_TOKEN,
+            "receipt_tokens": sc.get("receipts", 0) // CHARS_PER_TOKEN,
+        }
+
     @classmethod
     def _output_budget(cls, messages: list[dict]) -> int:
         """How many output tokens we can safely ask for without prompt+output blowing the
@@ -208,7 +515,11 @@ class Agent:
 
     @classmethod
     def _compact_tool_results(
-        cls, messages: list[dict], max_chars: int = 360_000, keep_recent: int = 6
+        cls,
+        messages: list[dict],
+        max_chars: int = 360_000,
+        keep_recent: int = 6,
+        receipts_by_tcid: dict | None = None,
     ) -> list[dict]:
         """In-turn Tier-1 compaction (Claude-Code style): when a single turn's history
         balloons past max_chars, *clear* old bulk rather than truncate it. This is what
@@ -216,12 +527,17 @@ class Agent:
 
         Two kinds of bulk get shed from older messages (the most recent `keep_recent`
         stay fully intact so the model keeps its working set):
-          - old tool results → replaced with a short marker
+          - old tool results → replaced with a short marker (or, for a receipted action, with
+            its durable one-line receipt — see C3 graduated eviction)
           - old assistant reasoning_content (Kimi's thinking, which accumulates fast) →
             dropped; it only needs to round-trip for the recent turns, not ancient ones
         Truncating mid-string corrupts JSON/HTML and still costs tokens, so we clear whole
         fields. This is the IN-turn safety net; across turns, store.compile_context bounds
-        the window from the source of truth."""
+        the window from the source of truth.
+
+        `receipts_by_tcid` maps a tool_call_id → its allowed receipt dict (gathered in the
+        loop), kept OUT of the message dicts so no private key ever rides to the model."""
+        receipts_by_tcid = receipts_by_tcid or {}
         total = sum(cls._msg_size(m) for m in messages)
         if total <= max_chars:
             return messages
@@ -240,7 +556,16 @@ class Agent:
                 total -= len(str(rc))
             if total > max_chars and m.get("role") == "tool":
                 content = str(m.get("content") or "")
-                if len(content) > 600:
+                # Graduated eviction (C3): a receipted action collapses to its durable one-line
+                # receipt — more useful than the generic 'cleared' marker and the same string the
+                # across-turn window will show — BEFORE the generic >600-char clearing.
+                receipt = receipts_by_tcid.get(m.get("tool_call_id"))
+                if receipt:
+                    line = store.receipt_line(receipt)
+                    if len(content) > len(line):
+                        out[i] = {**m, "content": line}
+                        total -= len(content) - len(line)
+                elif len(content) > 600:
                     marker = f"[old tool result cleared — was {len(content):,} chars]"
                     out[i] = {**m, "content": marker}
                     total -= len(content) - len(marker)
@@ -290,12 +615,100 @@ class Agent:
             return {**tm, "content": "[redacted — secret value, not stored]"}
         return tm
 
+    def _promote_on_demand(self, name: str) -> list[str]:
+        """Grow the live promotion set to include a real-but-un-promoted tool the model just
+        called (F6 lazy-load recovery, worker tier). Adds the tool itself plus every _TOOL_GROUPS
+        group it belongs to (so a related follow-up call lands promoted too), intersected with the
+        real registry so parity holds. Returns the names newly added (for the retry note). Caller
+        rebuilds the per-round `tools` from self._promoted_names so the schema is actually sent
+        next round."""
+        if self._promoted_names is None:
+            return []
+        grow: set[str] = {name}
+        for _kw, group_tools in _TOOL_GROUPS.values():
+            if name in group_tools:
+                grow.update(group_tools)
+        grow &= set(TOOL_HANDLERS)
+        added = sorted(grow - self._promoted_names)
+        self._promoted_names.update(grow)
+        return added
+
     async def _exec_tool(self, tool_call) -> dict:
         name = tool_call.function.name
+
+        # After-model rejection gate (D2) + promote-on-demand recovery (F6): the brain saw the
+        # one-line index (D1) and called a real-but-un-promoted tool. Instead of a dead-end error,
+        # GROW the promotion set to include it (and its group) and tell the model to retry — the
+        # loop rebuilds `tools` from self._promoted_names each round, so the newly-loaded schema is
+        # sent next round (D1's "schemas load on demand" made real). String result, never raises.
+        # Only active when run() set a promotion; on the orchestrator tier _promoted_names is the
+        # full registry, so this never fires there.
+        if self._promoted_names is not None and name not in self._promoted_names and name in TOOL_HANDLERS:
+            added = self._promote_on_demand(name)
+            await self._emit("status", {"status": "tool_loaded_on_demand", "message": name})
+            return {
+                "role": "tool",
+                "tool_call_id": tool_call.id,
+                "content": json.dumps(
+                    {"now_available": added, "note": "tool loaded — retry the call"}
+                ),
+            }
+
         try:
             params = json.loads(tool_call.function.arguments)
         except json.JSONDecodeError:
             params = {}
+
+        # Escalation dedup guard (F4): on a confidence-escalation re-run (self._escalated), an
+        # external/irreversible ACTION whose EXACT params already fired this turn must NOT re-fire —
+        # the orchestrator re-reasons over prior tool results, it doesn't replay side effects. Use
+        # the SAME digest the receipt writer uses, with the turn start as the since-cutoff, so a hit
+        # is the precise 'this already went out'. Gated strictly on _escalated — a normal turn that
+        # legitimately repeats an action is untouched. Short-circuits before the handler runs.
+        if self._escalated and name in _ESCALATION_DEDUP_TOOLS:
+            target = str(params.get("to") or params.get("target") or params.get("event_id") or "")
+            prior = store.action_already_fired(
+                name, target, audit._params_digest(params), self._turn_started_iso
+            )
+            if prior:
+                await self._emit("status", {"status": "action_already_fired", "message": name})
+                rid = (prior.get("receipt_id") or "")[:12]
+                return {
+                    "role": "tool",
+                    "tool_call_id": tool_call.id,
+                    "content": (
+                        f"[already done this turn] {name} to {target or '(no target)'} already "
+                        f"completed (receipt {rid}) — not repeating it — finalize."
+                    ),
+                }
+
+        # Deterministic precondition gate (E): unbypassable world-state floor read at dispatch
+        # (e.g. make_call only when no call is live). Composes with D — D blocks "not promoted
+        # this turn", E blocks "not allowed in current world-state". String result, never raise.
+        pred = policy.PRECONDITIONS.get(name)
+        if pred:
+            block = pred(params)
+            if block:
+                await self._emit("status", {"status": "tool_blocked", "message": name})
+                return {"role": "tool", "tool_call_id": tool_call.id, "content": block}
+
+        # Autonomy safety gate (default-on, fail-open): for a side-effecting ACTION tool, a cheap
+        # utility-model rubric decides whether it's clearly safe to run autonomously BEFORE any
+        # side effect fires. Runs before capture_receipts + the handler, so a held action never
+        # executes; the block is recorded as a blocked receipt (name is ACTION in _TOOL_KINDS, so
+        # the chain stays correct). Complements the persona clause and the in-handler self-gates.
+        if policy.tool_kind(name) == policy.TOOL_KIND.ACTION:
+            ok, reason = await self._is_safe_action(name, params)
+            if not ok:
+                audit.record(
+                    name,
+                    target=str(params.get("to") or params.get("target") or ""),
+                    decision="blocked",
+                    reason="safety gate",
+                    params=params,
+                )
+                await self._emit("status", {"status": "tool_safety_blocked", "message": name})
+                return {"role": "tool", "tool_call_id": tool_call.id, "content": reason}
 
         emit_params = (
             {**params, "value": "[redacted]"}
@@ -304,6 +717,10 @@ class Agent:
         )
         await self._emit("tool_call", {"tool": name, "params": emit_params})
 
+        # Capture the receipts THIS call mints. Each tool in a round runs as its own gathered
+        # task with its own context copy, so the box is private to this call — exact attribution
+        # with no high-water racing between concurrent tools (e.g. two send_email in one round).
+        minted = audit.capture_receipts()
         handler = TOOL_HANDLERS.get(name)
         if handler:
             try:
@@ -320,18 +737,110 @@ class Agent:
         else:
             shown = result_str[:2000] + ("…" if len(result_str) > 2000 else "")
         await self._emit("tool_result", {"tool": name, "result": shown})
-        return {"role": "tool", "tool_call_id": tool_call.id, "content": result_str}
+        tm: dict = {"role": "tool", "tool_call_id": tool_call.id, "content": result_str}
+        # Carry the allowed receipt this action produced (if any) as a private hint: it lets
+        # in-turn compaction collapse this row to the one-line receipt, and lets the persist
+        # step back-link the receipt to the row's message_id. Stripped before the model sees it.
+        if policy.tool_kind(name) == policy.TOOL_KIND.ACTION:
+            for r in minted:
+                if r["decision"] == "allowed":
+                    tm["_receipt"] = r
+                    break
+        return tm
 
     @staticmethod
     def _fingerprint(tool_calls) -> str:
         parts = sorted((tc.function.name, tc.function.arguments or "") for tc in tool_calls)
         return hashlib.sha1(json.dumps(parts).encode()).hexdigest()[:16]
 
-    async def _tool_loop(self, messages: list[dict]) -> str:
+    async def _dry_plan_consensus(
+        self, messages: list[dict], tools: list[dict], k: int = _DRY_CONSENSUS_K
+    ) -> str | None:
+        """Side-effect-free self-consistency on the RISKY first move of a high-stakes ACTION turn.
+
+        Sample only the FIRST model response k times (with tools= but NEVER dispatching any
+        tool_call), fingerprint each proposed call-set via _fingerprint, and tally. If a strict
+        majority agree, return None — the real loop will produce that same plan and execute it
+        EXACTLY ONCE through the normal path. On disagreement return the re-ground note to inject.
+        Never runs a tool, never mints a receipt; a sample error is skipped (no fail-closed).
+
+        This is the safe analog of K=5 self-consistency for a side-effecting agent: we vote the
+        decision, not the execution."""
+        votes: list[str] = []
+        send = self._compact_tool_results(messages)
+        budget = self._output_budget(send)
+        for _ in range(max(1, k)):
+            try:
+                resp = await llm_create(
+                    model=self.model,
+                    messages=send,
+                    tools=tools,
+                    tool_choice="auto",
+                    temperature=0.7,
+                    max_tokens=budget,
+                )
+            except BudgetExceeded:
+                raise
+            except Exception as e:
+                log.warning("dry_consensus_sample_failed", err=str(e))
+                continue
+            msg = resp.choices[0].message
+            # WORKER_MODEL (DeepSeek) can return content=None with text in reasoning_content; this
+            # runs on the orchestrator (Opus) in practice, but mirror _tool_loop's handling anyway.
+            if getattr(msg, "tool_calls", None):
+                votes.append(self._fingerprint(msg.tool_calls))
+            else:
+                votes.append("TEXT")
+        if not votes:
+            return None  # all samples failed — fall through to the normal loop (fail open)
+        top = max(set(votes), key=votes.count)
+        agree = votes.count(top)
+        await self._emit("status", {
+            "status": "dry_consensus",
+            "message": f"{agree}/{len(votes)} agreed",
+        })
+        log.info("dry_plan_consensus", votes=len(votes), agree=agree, plan=top)
+        if agree > len(votes) // 2:
+            return None
+        return _DRY_REGROUND_NOTE
+
+    async def _tool_loop(
+        self, messages: list[dict], tools: list[dict] | None = None, user_message: str = ""
+    ) -> str:
+        # `tools` is the per-turn promoted schema subset (D2); fall back to the full registry
+        # so any caller that doesn't promote (or a None passed in) still works exactly as before.
+        # `user_message` is the ACTUAL current-turn trigger content (threaded from run()), used by
+        # the confidence judge and the 'response' emit — NOT messages[1], which is the oldest
+        # anchor in the compiled window, not this turn's request (F8).
+        tools = TOOL_DEFINITIONS if tools is None else tools
         # Out-of-model loop detection: if the model fires the exact same tool call(s)
         # over and over with no progress, a circuit breaker stops the turn.
         recent_fps: deque = deque(maxlen=6)
         loop_warned = False
+        # tool_call_id → its allowed receipt, so in-turn compaction can collapse a receipted
+        # action to its one-line receipt without ever stashing a private key on a model message.
+        receipts_by_tcid: dict[str, dict] = {}
+
+        # Dry planning-consensus (gated, default OFF): for a high-stakes ACTION turn on the
+        # orchestrator, vote the first move K times WITHOUT executing anything; on disagreement
+        # inject one re-ground note so the model re-checks live state before committing. The normal
+        # loop below still executes the agreed plan EXACTLY ONCE — this pre-pass never runs a tool.
+        if (
+            ENABLE_DRY_CONSENSUS
+            and not self._escalated
+            and self.model == ORCHESTRATOR_MODEL
+            and self._turn_important
+            and any(d["function"]["name"] in policy.ACTION_TOOLS for d in tools)
+        ):
+            try:
+                note = await self._dry_plan_consensus(messages, tools)
+                if note:
+                    messages.append({"role": "user", "content": note})
+            except BudgetExceeded:
+                raise
+            except Exception as e:
+                log.warning("dry_consensus_failed", err=str(e))
+
         for round_num in range(MAX_TOOL_ROUNDS):
             # Inject a pending Akshay heads-up at the TOP of the round so it's never
             # stranded when the model lands on a final text reply (the common case).
@@ -341,17 +850,27 @@ class Agent:
                 messages.append({"role": "user", "content": self._interrupt_note(interrupt)})
                 await self._emit("status", {"status": "interrupted", "message": "Akshay emailed — heads-up injected"})
 
+            # Rebuild `tools` from the live promotion set each round so a tool promoted on demand
+            # last round (F6) is actually sent this round. No-op on the orchestrator tier, where
+            # _promoted_names is already the full registry and `tools` is the full catalog.
+            if self._promoted_names is not None:
+                tools = [d for d in TOOL_DEFINITIONS if d["function"]["name"] in self._promoted_names]
+
             await self._emit("thinking", {})
-            send_messages = self._compact_tool_results(messages)
+            send_messages = self._compact_tool_results(messages, receipts_by_tcid=receipts_by_tcid)
 
             try:
                 response = await llm_create(
                     model=self.model,
                     messages=send_messages,
-                    tools=TOOL_DEFINITIONS,
+                    tools=tools,
                     tool_choice="auto",
                     max_tokens=self._output_budget(send_messages),
                 )
+            except BudgetExceeded:
+                # Hard monthly-cap backstop — not a transient. Let it propagate so a confidence
+                # escalation can fall back to the worker answer; run() turns it into a clean status.
+                raise
             except Exception as e:
                 # 429/5xx + connection errors were already retried (and failed over) inside
                 # llm_create. A 400 here is usually context overflow — trim HARD, shrink the
@@ -359,11 +878,13 @@ class Agent:
                 if "400" in str(e) or "context" in str(e).lower():
                     await self._emit("status", {"status": "retrying", "message": "400 — trimming context and retrying"})
                     try:
-                        send_messages = self._compact_tool_results(messages, max_chars=140_000)
+                        send_messages = self._compact_tool_results(
+                            messages, max_chars=140_000, receipts_by_tcid=receipts_by_tcid
+                        )
                         response = await llm_create(
                             model=self.model,
                             messages=send_messages,
-                            tools=TOOL_DEFINITIONS,
+                            tools=tools,
                             tool_choice="auto",
                             max_tokens=8192,
                         )
@@ -435,10 +956,21 @@ class Agent:
                 tool_msgs = await asyncio.gather(
                     *[self._exec_tool(tc) for tc in msg.tool_calls]
                 )
-                messages.extend(tool_msgs)
                 name_by_id = {tc.id: tc.function.name for tc in msg.tool_calls}
                 for tm in tool_msgs:
-                    store.append_message(self._redact_tool_for_store(tm, name_by_id))
+                    # _exec_tool tags an action's allowed receipt as a private hint. Pop it off
+                    # the dict that lands in `messages` so no private key ever reaches the model;
+                    # keep it in receipts_by_tcid for in-turn collapse and to back-link the row.
+                    receipt = tm.pop("_receipt", None)
+                    if receipt:
+                        receipts_by_tcid[tm["tool_call_id"]] = receipt
+                    messages.append(tm)
+                    kind = policy.tool_kind(name_by_id[tm["tool_call_id"]])
+                    mid = store.append_message(
+                        self._redact_tool_for_store(tm, name_by_id), tool_kind=kind
+                    )
+                    if receipt and receipt.get("receipt_id"):
+                        store.set_receipt_message_id(receipt["receipt_id"], mid)
 
                 # Near the round cap: tell the agent to land the turn instead of
                 # silently dropping it at the limit.
@@ -448,7 +980,49 @@ class Agent:
 
             else:
                 content = msg.content or ""
-                await self._emit("response", {"content": content, "trigger": messages[1].get("content", "") if len(messages) > 1 else ""})
+
+                # Confidence-gated escalation (gated, default OFF): the cheap worker just landed a
+                # FINAL text answer (no more tool calls) on a risky external turn. A utility judge
+                # scores the answer against THIS turn's actual request (user_message, threaded from
+                # run() — not the stale messages[1] anchor, F8); if low-confidence, re-run the loop
+                # ONCE on the orchestrator over the SAME messages (which already hold every prior
+                # tool result — Opus reasons over them, it does NOT replay side effects: the F4
+                # dedup guard hard-blocks any external action that already fired this turn, and an
+                # explicit '[system] already completed' note grounds it first). Single-shot + budget-safe.
+                if (
+                    ENABLE_CONFIDENCE_ESCALATION
+                    and not self._escalated
+                    and self._escalate_eligible
+                    and self.model == WORKER_MODEL
+                    and content.strip()
+                ):
+                    if not await self._score_answer(user_message, content):
+                        # Ground the orchestrator on what already happened this turn so it doesn't
+                        # even try to repeat a side effect (the F4 guard is the hard backstop).
+                        done = store.allowed_receipts_since(self._turn_started_iso)
+                        if done:
+                            lines = "\n".join(f"- {r['action']} → {r['target']}" for r in done)
+                            messages.append({"role": "user", "content": (
+                                "[system] These actions already completed this turn and must NOT be "
+                                f"repeated; only finalize / correct course if needed:\n{lines}"
+                            )})
+                        self._escalated = True
+                        self.model = ORCHESTRATOR_MODEL
+                        # On the orchestrator tier the rejection gate must bounce nothing, so the
+                        # promotion set becomes the full registry (matches run()'s Opus branch).
+                        self._promoted_names = set(TOOL_HANDLERS)
+                        await self._emit("status", {
+                            "status": "confidence_escalation",
+                            "message": "low-confidence worker answer — re-running on orchestrator",
+                        })
+                        log.info("confidence_escalation", trigger="final_text")
+                        try:
+                            return await self._tool_loop(messages, tools, user_message)
+                        except BudgetExceeded:
+                            log.warning("confidence_escalation_budget_exceeded")
+                            return content
+
+                await self._emit("response", {"content": content, "trigger": user_message})
                 return content
 
         return (

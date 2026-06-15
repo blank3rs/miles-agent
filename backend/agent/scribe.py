@@ -57,6 +57,44 @@ def _render_turn(msgs: list[dict]) -> str:
     return "\n".join(lines)
 
 
+_SUMMARY_SYSTEM = """You maintain Miles's rolling memory of EARLIER work this stretch — the older turns that have scrolled out of his verbatim window. You fold the turns that just fell off into the running summary so a future turn (or a restart) still knows what happened, without the raw transcript.
+
+Write multi-scale, most-recent-first: the turns that JUST fell off get a crisp sentence each (who/what/outcome — keep names, numbers, decisions, results); older material already in the running summary gets progressively compressed — recent older items stay as short lines, ancient ones collapse into a single trailing paragraph. Drop chatter, keep durable facts and open threads. Never invent; only what the turns and the prior summary show.
+
+Return ONLY the updated summary as plain prose/short lines. No preamble, no JSON, no fences."""
+
+
+async def update_history_summary(older_turns: list[list[dict]]) -> None:
+    """Fire-and-forget (B2): fold the older turns the verbatim window dropped into the durable
+    rolling summary, off the hot loop. Best-effort — must never block or break a turn."""
+    try:
+        rendered = "\n\n".join(_render_turn(t) for t in (older_turns or []) if t).strip()
+        if not rendered:
+            return
+
+        current = store.get_history_summary().strip()
+        user = (
+            f"Running summary so far:\n{current or '(none yet)'}\n\n"
+            f"Turns that just fell out of the verbatim window (newest first):\n{rendered}\n\n"
+            "Return the updated rolling summary."
+        )
+        resp = await llm_create(
+            model=UTILITY_MODEL,
+            messages=[
+                {"role": "system", "content": _SUMMARY_SYSTEM},
+                {"role": "user", "content": user},
+            ],
+            max_tokens=900,
+            temperature=0.2,
+        )
+        summary = _FENCE.sub("", (resp.choices[0].message.content or "").strip())
+        if summary:
+            store.set_history_summary(summary)  # clamped to the block char_limit
+            log.info("scribe_summary_updated", turns=len(older_turns), chars=len(summary))
+    except Exception as e:
+        log.warning("scribe_summary_failed", err=str(e))
+
+
 def _parse(raw: str) -> dict:
     raw = _FENCE.sub("", (raw or "").strip())
     try:
@@ -94,6 +132,7 @@ async def record_turn(trigger: str, turn_msgs: list[dict]) -> None:
 
         episodes = data.get("episodes") or []
         recorded = 0
+        recorded_rows: list[dict] = []
         for ep in episodes[:5]:
             if not isinstance(ep, dict):
                 continue
@@ -103,13 +142,22 @@ async def record_turn(trigger: str, turn_msgs: list[dict]) -> None:
             kind = str(ep.get("kind") or "observation").strip().lower()
             if kind not in _VALID_KINDS:
                 kind = "observation"
-            store.add_episode(kind, content)
+            ep_id = store.add_episode(kind, content)
+            recorded_rows.append({"id": ep_id, "kind": kind, "content": content})
             recorded += 1
 
         goal = str(data.get("goal") or "").strip()
         nxt = str(data.get("next_action") or "").strip()
         if goal or nxt:
             store.set_working_state(current_goal=goal or None, next_action=nxt or None)
+
+        # Active reconciliation: distill this turn's just-recorded episodes into bi-temporal
+        # facts (ADD/UPDATE/DELETE/NOOP), so accumulated knowledge auto-enters future turns.
+        # Off the hot loop already (the scribe is fire-and-forget); the surrounding try/except
+        # swallows + logs any failure so a reconciliation hiccup never affects a turn.
+        if recorded_rows:
+            from agent import facts
+            await facts.reconcile_facts(recorded_rows)
 
         log.info("scribe_recorded", trigger=trigger, episodes=recorded,
                  goal=bool(goal), next_action=bool(nxt))

@@ -50,3 +50,12 @@ VOICE_PUBLIC_HOST = os.getenv("VOICE_PUBLIC_HOST", "")
 # Shared secret in the wss URL — 443 is world-open, so /voice/stream only opens a
 # (paid) Gemini session when the token matches. Our TwiML includes it; nobody else has it.
 VOICE_STREAM_TOKEN = os.getenv("VOICE_STREAM_TOKEN", "")
+
+# Sandboxed code execution (exec_sandboxed). Limits enforced via rlimit in the prod Linux
+# container; on macOS local dev rlimit is skipped (the runner logs a warning). All env-overridable.
+SANDBOX_EXEC_CPU_SECONDS = int(os.getenv("SANDBOX_EXEC_CPU_SECONDS", "10"))
+SANDBOX_EXEC_MEM_MB      = int(os.getenv("SANDBOX_EXEC_MEM_MB", "512"))
+SANDBOX_EXEC_FSIZE_MB    = int(os.getenv("SANDBOX_EXEC_FSIZE_MB", "64"))
+SANDBOX_EXEC_TIMEOUT_S   = int(os.getenv("SANDBOX_EXEC_TIMEOUT_S", "30"))
+SANDBOX_EXEC_MAX_PER_DAY = int(os.getenv("SANDBOX_EXEC_MAX_PER_DAY", "200"))
+SANDBOX_EXEC_MAX_OUTPUT  = int(os.getenv("SANDBOX_EXEC_MAX_OUTPUT", "20000"))

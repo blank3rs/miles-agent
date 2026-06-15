@@ -255,7 +255,8 @@ async def send_email(to: str, subject: str, body: str, attachments: list | None 
     try:
         await asyncio.to_thread(_send)
         _record_send(recipients)  # count only successful sends toward the anti-spam cap
-        audit.record("send_email", target=to, decision="allowed", reason=subject[:80])
+        audit.record("send_email", target=to, decision="allowed", reason=subject[:80],
+                     params={"to": to, "subject": subject, "body": body})
         result = f"Sent from {EMAIL_ADDRESS} to {to} — {subject}"
         if attached:
             result += f"\nAttachments: {', '.join(attached)}"

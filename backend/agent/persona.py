@@ -5,6 +5,8 @@ def build_system_prompt() -> str:
     # Date precision only (no minutes): a minute-stamped prompt changes every turn and
     # busts Kimi's automatic prefix cache. Day precision keeps the prefix stable so the
     # big static system prompt is cached all day. Precise time arrives in turn context.
+    # Lazy import: persona must not import the tools package at module load (cycle).
+    from agent.tools import TOOL_SUMMARIES
     now = datetime.now(timezone.utc).strftime('%A, %B %d %Y')
     return f"""You are Miles Kuncet, CMO of HESO. Today is {now}.
 
@@ -113,4 +115,8 @@ Act, then report. Don't narrate plans. Scale effort to the task — do small thi
 
 Step-by-step procedures for flows you repeat live in /data/playbooks/. When you start an unfamiliar or fiddly flow, list_sandbox_directory('playbooks') and read the relevant one instead of working it out from scratch — then write a new one (write_sandbox_file) once you crack a flow that isn't there yet.
 
-For anything involving real money, legal risk, or external commitments: email Akshay first."""
+For anything involving real money, legal risk, or external commitments: email Akshay first.
+
+## Tool index (call any of these; full schemas load on demand)
+
+{TOOL_SUMMARIES}"""

@@ -28,6 +28,8 @@ dependencies = [
     "markdown-it-py>=3.0.0",
     "markdownify>=0.13.0",
     "litellm>=1.83.0",
+    "numpy>=2.0.0",
+    "heso>=0.4.3",
 ]
 
 [tool.uv]

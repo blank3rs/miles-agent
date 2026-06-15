@@ -14,3 +14,4 @@ enqueue_task: Callable | None = None  # thread-safe enqueue onto the agent queue
 # bridge holds the lease for the life of the call; the consumer waits on it between turns.
 pause_agent: Callable | None = None    # (reason: str) -> None  — acquire the lease
 resume_agent: Callable | None = None   # () -> None             — release the lease
+is_call_active: Callable | None = None  # () -> bool  — authoritative call-active read (same lease)

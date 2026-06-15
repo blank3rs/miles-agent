@@ -1,12 +1,10 @@
-"""Self-extension: install packages, run Python, run shell commands."""
+"""Self-extension: install packages, run shell commands. (run_python is deprecated — it now
+redirects to exec_sandboxed, which runs code in an isolated subprocess instead of in-process.)"""
 import asyncio
-import io
 import subprocess
 import sys
-import traceback
-from contextlib import redirect_stderr, redirect_stdout
 
-from agent.config import BACKEND_DIR, DATA_DIR, HESO_ROOT, SANDBOX_ROOT
+from agent.config import BACKEND_DIR, SANDBOX_ROOT
 
 _BLOCKED_SHELL = ["rm -rf /", "rm -rf ~", "sudo", "> /dev/", "dd if=", "mkfs"]
 
@@ -43,29 +41,13 @@ async def install_package(package: str) -> str:
 
 
 async def run_python(code: str) -> str:
-    """Execute Python code in-process and return stdout + stderr."""
-    stdout_buf = io.StringIO()
-    stderr_buf = io.StringIO()
-    try:
-        exec_globals = {
-            "__builtins__": __builtins__,
-            "sandbox_root": SANDBOX_ROOT,
-            "heso_root": HESO_ROOT,
-            "data_dir": DATA_DIR,
-        }
-        with redirect_stdout(stdout_buf), redirect_stderr(stderr_buf):
-            exec(compile(code, "<agent>", "exec"), exec_globals)  # noqa: S102
-        out = stdout_buf.getvalue()
-        err = stderr_buf.getvalue()
-        parts = []
-        if out:
-            parts.append(f"stdout:\n{out.strip()}")
-        if err:
-            parts.append(f"stderr:\n{err.strip()}")
-        return "\n\n".join(parts) if parts else "(no output)"
-    except Exception:
-        err = stderr_buf.getvalue()
-        return f"[exception]\n{traceback.format_exc()}\n{err}".strip()
+    """Deprecated. Used to exec code in-process (full builtins, real DB handle, full env —
+    a secret leak). Now a redirect: it never execs. Use exec_sandboxed instead."""
+    return (
+        "[run_python is deprecated] Use exec_sandboxed(code=...) — it runs in an isolated "
+        "subprocess with no access to my secrets, a temp working dir, CPU/memory limits, and a "
+        "read-only `miles` API for safe tools. Same code, safer boundary."
+    )
 
 
 async def run_shell(command: str) -> str:
@@ -121,7 +103,7 @@ DEFINITIONS = [
         "type": "function",
         "function": {
             "name": "run_python",
-            "description": "Execute arbitrary Python code and get stdout/stderr back. Use for data processing, prototyping, computation, or anything that needs code.",
+            "description": "Deprecated — use exec_sandboxed instead. Calling this just returns a redirect; it no longer runs any code (exec_sandboxed runs code in an isolated subprocess with no access to my secrets).",
             "parameters": {
                 "type": "object",
                 "properties": {

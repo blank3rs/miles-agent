@@ -88,6 +88,16 @@ def _build_tiers() -> dict:
 _TIERS = _build_tiers()
 UTILITY_MODEL = "utility"   # re-exported alias (scribe.py, style.py import this)
 
+# Orchestrator prompt caching. The Claude-native Foundry /anthropic surface is the ONLY tier that
+# honours cache_control; it's the model-string prefix every orchestrator deployment carries.
+# Anthropic renders `tools` BEFORE `system`, so a breakpoint on system[0] caches (tools + persona
+# prefix). The orchestrator now sends the FIXED full tool catalog (core.run's Opus branch), so that
+# prefix is byte-stable across turns and reads at ~0.1x within the TTL. Gated by env so it can be
+# flipped off without a redeploy if Foundry rejects it. Verify the real hit rate via the llm_cache
+# log (cache_read vs cache_creation) rather than assuming it.
+_CACHE_ELIGIBLE_PREFIX = "azure_ai/"
+_ORCH_PROMPT_CACHE = os.getenv("ORCH_PROMPT_CACHE", "true").lower() == "true"
+
 # Price each tier by its ALIAS, not the response model — a Foundry deployment id (which the
 # operator can rename via ORCH_DEPLOYMENT) often isn't in any price table, and metering the
 # orchestrator as if it were cheap is how a $300 cap becomes a $5k bill.
@@ -155,17 +165,37 @@ def _read_spend() -> dict:
 def _record_spend(resp, alias: str) -> None:
     # Prefer LiteLLM's exact cost when it knows the model; otherwise price by TIER (fail-safe
     # expensive) from usage. Never default to "cheapest" — an unknown model bills as the orchestrator.
+    usage = getattr(resp, "usage", None)
+    # Cache accounting. With prompt caching on, the OpenAI-normalized prompt_tokens EXCLUDES
+    # cached reads, so a cache-blind fallback both treats reads as free and skips the write
+    # premium — under-billing against the cap. Read the two cache counts (anthropic names first,
+    # OpenAI prompt_tokens_details.cached_tokens as fallback) and bill them explicitly below.
+    cr = cw = 0
+    if usage:
+        cr = getattr(usage, "cache_read_input_tokens", 0) or 0
+        cw = getattr(usage, "cache_creation_input_tokens", 0) or 0
+        if cr == 0:
+            details = getattr(usage, "prompt_tokens_details", None)
+            cr = getattr(details, "cached_tokens", 0) or 0
+        if alias == "orchestrator" or (_TIERS.get(alias, {}).get("model", "").startswith(_CACHE_ELIGIBLE_PREFIX)):
+            log.info("llm_cache", cache_read=cr, cache_creation=cw,
+                     prompt=getattr(usage, "prompt_tokens", 0) or 0)
+
     cost = 0.0
     try:
         cost = litellm.completion_cost(completion_response=resp) or 0.0
     except Exception:
         cost = 0.0
-    if not cost:
-        usage = getattr(resp, "usage", None)
-        if usage:
-            pin, pout = _TIER_PRICE.get(alias, _PRICING["claude-opus"])  # unknown alias -> most expensive
-            cost = ((getattr(usage, "prompt_tokens", 0) or 0) * pin
-                    + (getattr(usage, "completion_tokens", 0) or 0) * pout)
+    if not cost and usage:
+        pin, pout = _TIER_PRICE.get(alias, _PRICING["claude-opus"])  # unknown alias -> most expensive
+        prompt_tokens = getattr(usage, "prompt_tokens", 0) or 0
+        # prompt_tokens may already exclude reads (Anthropic shape) or not (some surfaces); subtract
+        # with a floor so a double-subtract can only mis-count the cheap 0.1x read, never the writes.
+        uncached = max(0, prompt_tokens - cr)
+        cost = (uncached * pin
+                + cr * pin * 0.1
+                + cw * pin * 1.25
+                + (getattr(usage, "completion_tokens", 0) or 0) * pout)
     if not cost:
         return
     try:
@@ -242,6 +272,32 @@ def _strip_reasoning(messages: list[dict]) -> list[dict]:
     return [{k: v for k, v in m.items() if k != "reasoning_content"} for m in messages]
 
 
+def _maybe_add_cache_control(call: dict, model: str) -> None:
+    """Attach an ephemeral cache breakpoint to the STABLE (first) system block — orchestrator
+    tier only. Anthropic renders `tools` BEFORE `system` and caches the prefix up to the
+    breakpoint, so tagging block[0] (persona + tool index) caches (tools + block[0]). That prefix
+    is reused across the many tool ROUNDS of a single turn always, and across TURNS only when the
+    next turn's tool set is byte-identical — which holds on this tier because the orchestrator now
+    sends the FIXED full catalog (any tool add/remove/reorder would otherwise invalidate the whole
+    prefix). So cross-turn reuse is real here, not universal magic; confirm it with the llm_cache
+    log. The volatile block (block[1+], the recompiled context) is intentionally left untagged so
+    we never pay the 1.25x write premium on content that never repeats. Copies the message dict and
+    content list before writing the key so the durable in-turn `messages` list (persisted + reused
+    across the tool loop) is never mutated — cache_control is a per-API-call directive and must not
+    reach the DB. No-op for any non-orchestrator tier or a string-content system message."""
+    if not (_ORCH_PROMPT_CACHE and model.startswith(_CACHE_ELIGIBLE_PREFIX)):
+        return
+    msgs = call.get("messages")
+    if not msgs or msgs[0].get("role") != "system":
+        return
+    content = msgs[0].get("content")
+    if not isinstance(content, list) or not content:
+        return
+    first = {**content[0], "cache_control": {"type": "ephemeral"}}
+    new_content = [first] + content[1:]
+    call["messages"] = [{**msgs[0], "content": new_content}] + msgs[1:]
+
+
 async def _attempt_tier(alias: str, kwargs: dict):
     """Run one tier's call with retries (status + connection/timeout), per-lane concurrency,
     and a wall-time cap for the orchestrator so a 429 storm fails over instead of stalling the
@@ -257,8 +313,14 @@ async def _attempt_tier(alias: str, kwargs: dict):
     call["api_key"] = tier["api_key"]
     call["num_retries"] = 0  # we own retries
     call.setdefault("max_tokens", 8192)  # Foundry's Claude surface rejects calls without it
+    # Foundry's Claude/Opus surface 400s on `temperature` ("deprecated for this model").
+    # litellm.drop_params can't predict this provider-specific rejection, so strip it on the
+    # orchestrator tier. Other tiers (DeepSeek/gpt-4o-mini/Kimi) still honor temperature.
+    if tier["model"].startswith(_CACHE_ELIGIBLE_PREFIX):
+        call.pop("temperature", None)
     if "kimi" not in tier["model"].lower() and call.get("messages"):
         call["messages"] = _strip_reasoning(call["messages"])
+    _maybe_add_cache_control(call, tier["model"])
 
     sem = _sem(tier["lane"])
     started = time.monotonic()

@@ -194,6 +194,8 @@ Everything in a browser goes through one tool: browser_task(task). You describe 
 agent = Agent()
 agent_queue: asyncio.Queue = asyncio.Queue()  # single queue for all agent tasks
 _event_loop: asyncio.AbstractEventLoop | None = None  # set in lifespan; used for thread→asyncio bridge
+# Strong refs to long-lived lifespan tasks so the event loop doesn't GC them mid-flight.
+_bg_tasks: set[asyncio.Task] = set()
 
 
 def _enqueue(item: dict) -> None:
@@ -268,6 +270,9 @@ async def _await_gate() -> None:
 
 runtime.pause_agent = _pause_agent
 runtime.resume_agent = _resume_agent
+# Authoritative call-active read off the same lease the gate already holds — true while a
+# call is live (gate cleared). No change to gate logic; E's preconditions read this at dispatch.
+runtime.is_call_active = lambda: not _agent_gate.is_set()
 
 # Serializes anything that mutates agent memory state — a turn (agent.run) and the idle
 # memory consolidation (dream). The single consumer already serializes turns with each other;
@@ -581,6 +586,128 @@ async def idle_consolidator():
                 log.warning("idle_consolidation_failed", err=str(e))
 
 
+_PRE_REASON_PROMPT = (
+    "You are Miles Kuncet's quiet pre-reasoning mind, working in the background while he's idle. "
+    "Below is everything currently in front of him: who he is, what he's in the middle of, his open "
+    "ledger, recent work, and cheap fresh signals (inbox, calendar) if available. Produce a SHORT "
+    "anticipatory heads-up he'll see at the top of his next turn — no fluff, no preamble, plain lines. "
+    "Cover only what's useful right now:\n"
+    "1. What's waiting on a reply or a follow-up (who, what, how overdue).\n"
+    "2. The single highest-value next move.\n"
+    "3. Anything time-sensitive — a deadline, a meeting, something that goes stale if ignored.\n"
+    "Be concrete: names, dates, specifics. If there's genuinely nothing worth flagging, reply with "
+    "exactly: (nothing pending). Keep it under ~10 lines. This is a hint, not an order — never invent work."
+)
+
+
+async def _gather_idle_signals_impl() -> str:
+    """Cheap, best-effort fresh signals for the sleep-time briefing — recent inbox + upcoming
+    calendar. Read off the hot loop; each guarded so a failure (no creds, API down) degrades to
+    an empty signal rather than skipping the briefing."""
+    from agent.tools.calendar_tools import list_calendar_events
+    from agent.tools.gmail import read_emails
+
+    parts: list[str] = []
+    try:
+        inbox = await read_emails(count=8)
+        if inbox and "[" not in inbox[:1]:  # not an error/empty marker
+            parts.append("## Recent inbox\n" + inbox[:2000])
+    except Exception:
+        pass
+    try:
+        cal = await list_calendar_events(days_ahead=3)
+        if cal and cal[:1] != "[" and not cal.startswith("(no events"):  # not an error/empty marker
+            parts.append("## Next 3 days\n" + cal[:1500])
+    except Exception:
+        pass
+    return "\n\n".join(parts)
+
+
+async def _gather_idle_signals() -> str:
+    """Wall-clock-bounded wrapper around the signal gather. The Google reads have no socket
+    timeout (httplib2 default), so a stalled TCP connection could hang indefinitely; the briefing
+    is best-effort, so on timeout we just proceed with empty signals rather than block the tick."""
+    try:
+        return await asyncio.wait_for(_gather_idle_signals_impl(), timeout=20)
+    except asyncio.TimeoutError:
+        return ""
+
+
+async def sleep_time_reasoner():
+    """Sleep-time compute (Letta / Anthropic context-engineering): when Miles is idle — not
+    running a turn, nothing queued, not on a call — run ONE cheap worker-tier completion over the
+    compiled context + open ledger + fresh signals to precompute an anticipatory briefing, and
+    write it as the `pre_reasoned` memory block STAMPED with a hash of its inputs. Every later turn
+    sees it via compile_context, but only while the stamp still matches current state (else it's
+    suppressed as stale). This is NOT agent.run: no message row, no scribe pass, no tool loop — a
+    single completion that refreshes a read-only block. Runs offset from the consolidator so the two
+    idle jobs don't fire on the same tick."""
+    from agent.llm import llm_create
+
+    await asyncio.sleep(150)  # offset past idle_consolidator's first window
+    while True:
+        await asyncio.sleep(180)
+        if agent.is_running or not agent_queue.empty() or not _agent_gate.is_set():
+            continue
+        # Don't recompute if the existing briefing is still fresh (its stamp still matches) — the
+        # idle loop fires often; only spend a worker call when the world it reasoned over has moved.
+        watermark = _SEEN_HISTORY_FILE.read_text().strip() if _SEEN_HISTORY_FILE.exists() else ""
+        current_stamp = store.pre_reasoned_stamp(watermark)
+        existing_stamp, existing_body = store.get_pre_reasoned()
+        if existing_body and existing_stamp == current_stamp:
+            continue
+        # Gather the cheap fresh signals BEFORE taking the turn lock: they don't feed the stamp
+        # (the stamp is recomputed from the watermark/store under the lock and never includes
+        # signals), so this has zero impact on staleness correctness — and it keeps the unbounded
+        # Google reads off the critical section, so a stalled socket can never hold _turn_lock and
+        # block the next queued turn (F7). The wrapper also caps the gather at 20s.
+        signals = await _gather_idle_signals()
+        # Mirror idle_consolidator: take the turn lock and re-check under it, so we never start a
+        # briefing in the gap before a just-enqueued turn grabs the lock. Bail if it's held.
+        if _turn_lock.locked():
+            continue
+        async with _turn_lock:
+            if agent.is_running or not agent_queue.empty() or not _agent_gate.is_set():
+                continue
+            try:
+                # Re-read state UNDER the lock so the stamp matches exactly the inputs we reason
+                # over — nothing can mutate the ledger/messages between read and stamp.
+                watermark = _SEEN_HISTORY_FILE.read_text().strip() if _SEEN_HISTORY_FILE.exists() else ""
+                stamp = store.pre_reasoned_stamp(watermark)
+                ctx = store.compile_context()
+                open_tasks = store._format_tasks(store.list_tasks())
+
+                user_blocks = [ctx["system_context"], "## Open ledger\n" + open_tasks]
+                if signals:
+                    user_blocks.append(signals)
+                user = "\n\n".join(b for b in user_blocks if b)
+
+                log.info("sleep_time_reason_start")
+                resp = await llm_create(
+                    model="worker",
+                    messages=[
+                        {"role": "system", "content": _PRE_REASON_PROMPT},
+                        {"role": "user", "content": user[:24000]},
+                    ],
+                    max_tokens=500,
+                    temperature=0.3,
+                )
+                msg = resp.choices[0].message
+                # WORKER_MODEL is DeepSeek (a reasoning model) — content can be None with the text
+                # in reasoning_content. Fall back so the briefing never crashes on .strip().
+                briefing = (msg.content or getattr(msg, "reasoning_content", "") or "").strip()
+                if not briefing or briefing.lower().startswith("(nothing pending"):
+                    # Nothing worth flagging — store an empty body under the current stamp so we
+                    # don't recompute until state actually moves, and compile shows nothing.
+                    store.set_pre_reasoned("", stamp)
+                    log.info("sleep_time_reason_empty")
+                else:
+                    store.set_pre_reasoned(briefing, stamp)
+                    log.info("sleep_time_reason_done", chars=len(briefing))
+            except Exception as e:
+                log.warning("sleep_time_reason_failed", err=str(e))
+
+
 def _keyring_selftest() -> None:
     """Verify the keyring actually unlocks. A wrong/missing KEYRING_PASSWORD makes
     every get_secret() return an error string that Miles can't tell from a real value
@@ -634,6 +761,14 @@ async def lifespan(app: FastAPI):
             _pb.write_text(_body)
             log.info("playbook_seeded", file=_fname)
 
+    # Real HESO Action Receipts — sign + ledger every consequential action (best-effort,
+    # no-op unless HESO_API_KEY is set). Sits behind the local audit chain in agent.audit.
+    try:
+        from agent import heso_receipts
+        heso_receipts.init_heso()
+    except Exception as e:
+        log.warning("heso_init_failed", err=str(e))
+
     # Init Graphiti knowledge graph
     runtime.graphiti = await init_graphiti()
 
@@ -681,9 +816,12 @@ async def lifespan(app: FastAPI):
     )
 
     scheduler.load_pending()
-    asyncio.create_task(agent_consumer())
-    asyncio.create_task(inbox_watcher())
-    asyncio.create_task(idle_consolidator())
+    # Strong refs so these long-lived tasks aren't garbage-collected mid-flight (asyncio only
+    # holds a weak ref to a bare create_task result).
+    _bg_tasks.add(asyncio.create_task(agent_consumer()))
+    _bg_tasks.add(asyncio.create_task(inbox_watcher()))
+    _bg_tasks.add(asyncio.create_task(idle_consolidator()))
+    _bg_tasks.add(asyncio.create_task(sleep_time_reasoner()))
 
     async def _boot_continuation():
         await asyncio.sleep(15)

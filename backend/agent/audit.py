@@ -19,7 +19,7 @@ from typing import Any
 
 import structlog
 
-from agent import heso_receipts, store
+from agent import store
 
 log = structlog.get_logger()
 
@@ -70,10 +70,6 @@ def record(
         box.append({"action": action, "target": target, "decision": decision,
                     "reason": reason, "receipt_id": digest})
     log.info("action_receipt", action=action, target=target, decision=decision, reason=reason)
-    # Also mint a real, offline-verifiable HESO ActionReceipt (best-effort, off the hot loop;
-    # no-op unless HESO_API_KEY is configured). The local chain above stands on its own.
-    heso_receipts.mint(action, target=target, decision=decision, reason=reason,
-                       params_digest=_params_digest(params))
     return digest
 
 

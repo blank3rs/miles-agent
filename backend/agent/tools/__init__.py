@@ -78,23 +78,25 @@ async def call_tool(name: str, **kwargs):
     if handler is None:
         return f"[unknown tool: {name}] Available: {sorted(TOOL_HANDLERS)}"
     # Same gates as the hot loop (core._exec_tool), so the skills/subagent bypass paths that never
-    # reach _exec_tool are gated identically. Lazy import keeps the package import-cycle free
-    # (safety imports llm + policy; policy is pure metadata).
+    # reach _exec_tool are gated identically. Lazy imports keep the package import-cycle free.
     #
     # Deterministic precondition gate FIRST (mirrors _exec_tool's order): a world-state floor the
     # tool can't self-check — e.g. make_call only when no call is live — so composing make_call
     # through a skill/subagent during an active call is bounced here too, not just on the hot loop.
-    from agent import policy, safety
+    import asyncio
+
+    from agent import heso_receipts, policy
     pred = policy.PRECONDITIONS.get(name)
     if pred:
         block = pred(kwargs)
         if block:
             return block
-    # Autonomy safety gate. Research-only toolsets are unaffected — read/search tools aren't
-    # ACTION tools, so is_safe_action short-circuits to allow with no LLM call.
-    ok, reason = await safety.is_safe_action(name, kwargs)
-    if not ok:
-        return reason
+    # HESO governance gate for side-effecting ACTION tools (same authority as the hot loop).
+    # Reads/research tools aren't ACTION, so they're never gated. Fails open if HESO is off.
+    if policy.tool_kind(name) == policy.TOOL_KIND.ACTION:
+        decision, reason = await asyncio.to_thread(heso_receipts.gate, name, kwargs)
+        if decision in ("block", "suspend"):
+            return reason
     try:
         return await handler(**kwargs)
     except TypeError as e:

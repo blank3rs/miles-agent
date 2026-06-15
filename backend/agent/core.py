@@ -9,7 +9,7 @@ from typing import Callable
 
 import structlog
 
-from agent import audit, policy, safety, scribe, store
+from agent import audit, heso_receipts, policy, scribe, store
 from agent.config import AKSHAY_EMAIL, LOGS_DIR, ORCHESTRATOR_MODEL, WORKER_MODEL
 from agent.llm import UTILITY_MODEL, BudgetExceeded, llm_create
 from agent.persona import build_system_prompt
@@ -256,12 +256,6 @@ class Agent:
             return ans.startswith("important") or ans.startswith("yes")
         except Exception:
             return False
-
-    async def _is_safe_action(self, name: str, params: dict) -> tuple[bool, str]:
-        """Autonomy safety gate for a side-effecting ACTION tool. Delegates to the single
-        implementation in agent.safety so the hot loop and the call_tool bypass path can't drift.
-        (True, '') allows; (False, reason) holds. Fails OPEN — a utility outage never blocks."""
-        return await safety.is_safe_action(name, params)
 
     async def _score_answer(self, user_message: str, answer: str) -> bool:
         """Utility judge at the final-answer seam: True when the worker's reply is confidently
@@ -692,22 +686,24 @@ class Agent:
                 await self._emit("status", {"status": "tool_blocked", "message": name})
                 return {"role": "tool", "tool_call_id": tool_call.id, "content": block}
 
-        # Autonomy safety gate (default-on, fail-open): for a side-effecting ACTION tool, a cheap
-        # utility-model rubric decides whether it's clearly safe to run autonomously BEFORE any
-        # side effect fires. Runs before capture_receipts + the handler, so a held action never
-        # executes; the block is recorded as a blocked receipt (name is ACTION in _TOOL_KINDS, so
-        # the chain stays correct). Complements the persona clause and the in-handler self-gates.
+        # Governance gate: HESO (the policy engine) authorizes every side-effecting ACTION tool
+        # BEFORE it runs (verdict computed off the event loop). allow -> proceed; block -> refuse;
+        # require_approval for the floored verbs (payment/delete/account_change/data_export) ->
+        # suspend, refuse-pending-human and route Miles to the email-Akshay escape valve. FAILS
+        # OPEN: if HESO is unconfigured or errors, gate() returns "skip" and the action proceeds,
+        # so the loop is never bricked; the persona clause + in-handler self-gates remain the live
+        # backstop. This replaces the old utility-classifier autonomy gate.
         if policy.tool_kind(name) == policy.TOOL_KIND.ACTION:
-            ok, reason = await self._is_safe_action(name, params)
-            if not ok:
+            decision, reason = await asyncio.to_thread(heso_receipts.gate, name, params)
+            if decision in ("block", "suspend"):
                 audit.record(
                     name,
                     target=str(params.get("to") or params.get("target") or ""),
-                    decision="blocked",
-                    reason="safety gate",
+                    decision="blocked" if decision == "block" else "suspended",
+                    reason=f"heso:{decision}",
                     params=params,
                 )
-                await self._emit("status", {"status": "tool_safety_blocked", "message": name})
+                await self._emit("status", {"status": f"tool_heso_{decision}", "message": name})
                 return {"role": "tool", "tool_call_id": tool_call.id, "content": reason}
 
         emit_params = (

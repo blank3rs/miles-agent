@@ -118,68 +118,13 @@ PRECONDITIONS: dict[str, Precondition] = {
 }
 
 
-# ── Autonomy safety gate (reliability) ──────────────────────────────────────────
-# A cheap external backstop in front of side-effecting ACTION tools: before a real external
-# effect fires, a utility-model rubric asks "is this clearly safe to do autonomously". It
-# COMPLEMENTS the persona money/legal/external clause (persona.py) and the in-handler self-gates
-# (gmail anti-spam / sensitive-data, web_cli LinkedIn) — it never replaces them. The LLM call
-# lives in agent/safety.py so this module stays pure metadata with no llm import / import cycle.
-
 # Single source for "which tools are side-effecting", derived from the receipt tagging above so
-# the gate and the dry-consensus pre-pass can never drift from what mints a receipt.
+# the dry-consensus pre-pass and the governance gate can never drift from what mints a receipt.
+# Governance of ACTION tools now runs through the HESO policy engine (agent/heso_receipts.gate),
+# called by core._exec_tool / tools.call_tool before any side effect — that replaced the old
+# utility-classifier autonomy gate. The persona money/legal/external clause and the in-handler
+# self-gates (gmail anti-spam/sensitive-data, web_cli LinkedIn) remain.
 ACTION_TOOLS: frozenset[str] = frozenset(n for n, k in _TOOL_KINDS.items() if k == TOOL_KIND.ACTION)
-
-# ACTION tools that mutate only local miles.db / sandbox state and are cheap+safe to allow with
-# no LLM round-trip: the task ledger, heartbeats, journal/dream, and sandbox/file writes. The
-# gated set is everything external-effecting or destructive (send_email, make_call, calendar,
-# secrets, package/skill install, browser profile reset).
-SAFETY_SKIP: frozenset[str] = frozenset({
-    "update_task", "add_task", "set_focus",
-    "set_heartbeat", "cancel_heartbeat",
-    "journal_entry", "dream",
-    "edit_file", "write_sandbox_file",
-})
-
-# Utility-model yes/no rubric, shaped like _IMPORTANCE_PROMPT (core.py). Asks one question and
-# wants one word back. It complements — never restates — the persona security clause.
-SAFETY_RUBRIC = (
-    "You are the autonomy safety check for Miles, an autonomous CMO agent that is about to take a "
-    "concrete external or destructive action on its own. Miles already follows a standing rule: "
-    "anything involving real money, legal risk, or an external commitment goes to Akshay first. "
-    "Given the action below, answer whether it is CLEARLY safe to perform autonomously right now: "
-    "no real money / legal exposure / external commitment without Akshay, no sending sensitive data "
-    "or secrets to an outside party, no irreversible deletion of someone else's data. "
-    "If it is plainly fine (a normal email, a routine calendar reply, a sensible automation), answer "
-    "'safe'. If it carries any of those risks or you're unsure, answer 'hold'. "
-    "Reply with exactly one word: safe or hold."
-)
-
-# Params we must NEVER let into the classifier's view — secret values would otherwise be sent to
-# the utility model. (store_secret/delete_secret are gated ACTIONS, so their summary must elide.)
-_SAFETY_SECRET_KEYS = frozenset({"value", "secret", "password", "token", "api_key"})
-
-
-def safety_needs_check(name: str) -> bool:
-    """True when the safety gate should run the utility classifier for this tool: it is a
-    side-effecting ACTION and not in the locally-scoped SAFETY_SKIP set. Pure metadata."""
-    return name in ACTION_TOOLS and name not in SAFETY_SKIP
-
-
-def summarize_params(name: str, params: dict) -> str:
-    """Compact one-line 'tool to=… subject=…' summary fed to the safety classifier. Secret-bearing
-    values are elided (never sent to the model); the whole line is truncated so a long email body
-    can't blow the utility call. Pure, no side effects."""
-    bits: list[str] = []
-    for k, v in (params or {}).items():
-        if k in _SAFETY_SECRET_KEYS:
-            bits.append(f"{k}=[redacted]")
-            continue
-        s = " ".join(str(v).split())
-        if len(s) > 160:
-            s = s[:160] + "…"
-        bits.append(f"{k}={s}")
-    summary = f"{name} " + " ".join(bits)
-    return summary[:400]
 
 
 def validate_policy() -> None:

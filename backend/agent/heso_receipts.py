@@ -1,24 +1,28 @@
 """Real HESO Action Receipts (the @hesohq SDK the audit.py docstring reserved a slot for).
 
-Miles already mints a local hash-chained receipt for every consequential action
-(agent/audit.py). This layer ALSO signs an offline-verifiable, Ed25519-signed HESO
-ActionReceipt via the `heso` SDK (Rust engine, in-process) and best-effort pushes it to the
-HESO cloud ledger — so HESO's own thesis runs on Miles himself.
+HESO is the GOVERNANCE LAYER for Miles's side-effecting actions (the @hesohq SDK the audit.py
+docstring reserved a slot for). The dispatcher (core._exec_tool / tools.call_tool) calls gate()
+BEFORE running any ACTION tool: HESO's policy engine (Rust, in-process) authorizes it, signs an
+offline-verifiable Ed25519 ActionReceipt, and pushes it to the HESO cloud ledger — so HESO's own
+thesis runs on Miles himself.
 
-RECORD-AND-SIGN mode: HESO observes, redacts PII, and signs every allowed action, but it does
-NOT gate/block Miles here. The enforcing layers stay the local audit chain, the persona
-security clause, and the in-loop safety gate. Enforcing mode — where HESO can suspend an action
-for a human co-sign per the policy in <project_root>/heso.toml (delete / large payment already
-require_approval there) — is a deliberate later flip, not on by default, because it can park a
-real action waiting on a human.
+ENFORCING mode: gate() returns allow / block / suspend. Floored verbs (payment / delete /
+account_change / data_export) come back SUSPENDED — policy requires a human co-sign — and the
+dispatcher refuses them, routing Miles to the email-Akshay escape valve. Everything mapped to
+tool_call is allowed and runs. This REPLACES the old utility-classifier autonomy gate; the
+persona security clause and the in-handler self-gates (gmail anti-spam, web_cli LinkedIn) remain.
 
-Fully best-effort and isolated. If HESO_API_KEY is unset, heso.toml/identity are missing, the
-key passphrase isn't provided, or any call fails, Miles runs exactly as before. Minting runs
-off the hot loop on a single background thread, so a turn is never blocked or broken by HESO.
+FAIL OPEN by construction: if HESO_API_KEY is unset, heso.toml/identity are missing, the key
+passphrase isn't provided, or heso.process errors, gate() returns "skip" and the action proceeds
+— a HESO outage can never brick the loop. The verdict is a fast local Rust call; the ledger push
+is offloaded to the background pool so the gate adds no network latency.
+
+To actually RESUME a suspended action (vs route to email), enroll an approver in the HESO console
+so a human can co-sign it to L1 — that browser/device step is out of band of this process.
 
 Enable in prod: scaffold the project on the data volume once (`heso init /data`), set
 HESO_API_KEY (heso_live_...), HESO_KEY_PASSPHRASE (the identity key passphrase), and optionally
-HESO_ENDPOINT (default https://cloud.heso.io). Without HESO_API_KEY this module is a no-op.
+HESO_ENDPOINT (default https://api.heso.ca). Without HESO_API_KEY this module is a no-op (skip).
 """
 from __future__ import annotations
 
@@ -83,56 +87,61 @@ def enabled() -> bool:
     return _enabled
 
 
-def mint(
-    action: str,
-    *,
-    target: str = "",
-    decision: str = "allowed",
-    reason: str = "",
-    params_digest: str = "",
-) -> None:
-    """Best-effort, non-blocking: sign a HESO ActionReceipt for one action and push it to the
-    ledger. Returns immediately (work runs on the background thread); never raises."""
+def gate(name: str, params: dict) -> tuple[str, str]:
+    """ENFORCING governance gate — run once per side-effecting ACTION BEFORE it executes. Returns
+    (decision, reason):
+      "allow"   → run the action (HESO policy allowed it; its signed receipt pushes in the bg)
+      "block"   → HESO policy blocked it; `reason` is the message handed back to the model
+      "suspend" → HESO requires a human co-sign (floored verbs: payment/delete/account_change/
+                  data_export); refuse pending approval, `reason` routes to the email-Akshay valve
+      "skip"    → HESO unconfigured or errored → caller allows (FAIL OPEN; never bricks the loop —
+                  the persona clause + in-handler self-gates stay the live protection)
+    The verdict (heso.process) is a fast local Rust call; the ledger push is offloaded to the
+    background pool so the gate adds no network latency to the action. Never raises."""
     if not _enabled or _pool is None:
-        return
-    try:
-        _pool.submit(_mint_blocking, action, target, decision, reason, params_digest)
-    except Exception as e:
-        log.warning("heso_mint_dispatch_failed", action=action, err=str(e))
-
-
-def _mint_blocking(action: str, target: str, decision: str, reason: str, params_digest: str) -> None:
+        return "skip", ""
     try:
         import heso
-        import heso.cloud
 
         act = heso.Action(
-            verb=_verb_for(action),
-            tool_name=action,
+            verb=_verb_for(name),
+            tool_name=name,
             workflow=_WORKFLOW,
             account=_ACCOUNT,
-            fields={
-                "target": target or "",
-                "decision": decision,
-                "reason": reason or "",
-                "params_digest": params_digest or "",
-            },
+            fields={"target": str(params.get("to") or params.get("target") or "")},
         )
         outcome = heso.process(act)
         rcpt = outcome.receipt if isinstance(outcome.receipt, dict) else {}
-        # Only a finalized (signed) receipt carries content.action_hash and is pushable. A floored
-        # verb (account_change/delete/payment/data_export) comes back SUSPENDED with no finalized
-        # receipt — HESO is saying "this needs a human co-sign", there is nothing to push — so
-        # record the outcome instead of erroring on a half-built receipt.
-        pushed = False
         if rcpt.get("content", {}).get("action_hash"):
-            try:
-                heso.cloud.push_receipt(rcpt)
-                pushed = True
-            except Exception as e:
-                # Ledger unreachable — the receipt is still signed + chained locally; the outbox
-                # retries on the next push. Not an error for Miles.
-                log.info("heso_push_deferred", action=action, err=str(e))
-        log.info("heso_receipt", action=action, kind=str(getattr(outcome, "kind", "")), pushed=pushed)
+            _pool.submit(_push_async, rcpt, name)  # ledger push off the gate's hot path
+        kind = outcome.kind
+        if kind == heso.OutcomeKind.BLOCKED:
+            log.info("heso_gate", action=name, decision="block")
+            return "block", "[blocked — HESO policy] " + (
+                getattr(outcome, "reason", "") or "This action is blocked by policy."
+            )
+        if kind == heso.OutcomeKind.SUSPENDED:
+            log.info("heso_gate", action=name, decision="suspend")
+            return "suspend", (
+                "[needs approval — HESO] This is a governed action (payment / delete / "
+                "account-change / data-export) that policy requires a human to co-sign before it "
+                "runs. It's logged for approval. For anything involving real money, legal risk, or "
+                "an external commitment, email Akshay per your standing rule — or ask him to "
+                "approve or do it himself."
+            )
+        log.info("heso_gate", action=name, decision="allow")
+        return "allow", ""
     except Exception as e:
-        log.warning("heso_mint_failed", action=action, err=str(e))
+        log.warning("heso_gate_failed_open", action=name, err=str(e))
+        return "skip", ""
+
+
+def _push_async(rcpt: dict, name: str) -> None:
+    """Push one finalized receipt to the ledger off the gate path. Best-effort; never raises."""
+    try:
+        import heso.cloud
+
+        heso.cloud.push_receipt(rcpt)
+        log.info("heso_receipt", action=name, pushed=True)
+    except Exception as e:
+        log.info("heso_push_deferred", action=name, err=str(e))
